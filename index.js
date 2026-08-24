@@ -53,7 +53,17 @@ pipe.on('data', async (data) => {
     await pear.ready()
     await pear.updater.applyUpdate()
     pipe.write('pear:updateApplied')
-  } else console.log(message)
+    return
+  }
+
+  try {
+    const msg = JSON.parse(message)
+    if (msg.type === 'ping') {
+      pipe.write(JSON.stringify({ type: 'pong', time: new Date().toISOString() }))
+    }
+  } catch {
+    console.log(message)
+  }
 })
 
 pipe.write('Hello from worker')
