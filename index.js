@@ -6,6 +6,9 @@ const FramedStream = require('framed-stream')
 const path = require('bare-path')
 const dir = require('bare-storage')
 const { isBareKit } = require('which-runtime')
+const Autobase = require('autobase')
+const Hyperbee = require('hyperbee')
+const crypto = require('hypercore-crypto')
 
 // mobile doesn't have the executable path (argv[0])
 // and the worker entry path (argv[1]) in the workers argv‘s
@@ -22,14 +25,17 @@ const updaterConfig = {
 }
 
 const pipe = new FramedStream(Bare.IPC)
-const store = new Corestore(path.join(updaterConfig.dir, 'pear-runtime', 'corestore'))
+const updater_store = new Corestore(path.join(updaterConfig.dir, 'pear-runtime', 'corestore'))
+const updater_swarm = new Hyperswarm()
+const store = new Corestore(path.join(updaterConfig.dir, 'app-storage', 'bee'))
 const swarm = new Hyperswarm()
-const pear = new PearRuntime({ ...updaterConfig, swarm, store })
+const pear = new PearRuntime({ ...updaterConfig, swarm: updater_swarm, store: updater_store })
+const topicForAll = crypto.data(Buffer.from('anyone'))
 
 pear.updater.on('error', console.error)
 if (updaterConfig.updates !== false) {
-  swarm.on('connection', (connection) => store.replicate(connection))
-  swarm.join(pear.updater.drive.core.discoveryKey, {
+  updater_swarm.on('connection', (connection) => updater_store.replicate(connection))
+  updater_swarm.join(pear.updater.drive.core.discoveryKey, {
     client: true,
     server: false
   })
@@ -41,11 +47,38 @@ pear.updater.on('updating', () => pipe.write('updating'))
 pear.updater.on('updated', () => pipe.write('updated'))
 pear.on('minver-required', () => pipe.write('minver-required')) // for mobile store update notification
 
+const base = new Autobase(store, null, {
+  apply: async (batch, view, host) => {
+    for (const node of batch) {
+      const { op } = node
+
+      //verify block here
+
+      await host.ackWriter(node.from.key)
+      if (op.type === 'create-poll') {
+        await view.put(`polls/${op.id}`, JSON.stringify(op.data))
+      } else if (op.type === 'cast-vote') {
+        await view.put(`votes/${op.pollId}/${op.author}`, JSON.stringify(op.data))
+      } else if (op.type === 'add-comment') {
+        await view.put(`comments/${op.pollId}/${op.timestamp}-${op.author}`, JSON.stringify(op.data))
+      }
+    }
+  },
+  open: (store) => {
+    const core = store.get({ name: 'view' })
+    return new Hyperbee(core, { keyEncoding: 'utf-8', valueEncoding: 'utf-8' })
+  }
+})
+
 goodbye(async () => {
+  await updater_swarm.destroy()
   await swarm.destroy()
   await pear.close()
+  await updater_store.close()
   await store.close()
 })
+
+await base.ready()
 
 pipe.on('data', async (data) => {
   const message = data.toString()
@@ -60,10 +93,48 @@ pipe.on('data', async (data) => {
     const msg = JSON.parse(message)
     if (msg.type === 'ping') {
       pipe.write(JSON.stringify({ type: 'pong', time: new Date().toISOString() }))
+    } else if (msg.type === 'poll') {
+      await handlePoll(msg.data)
+    } else if (msg.type === 'comment') {
+      await handleComment(msg.data)
     }
   } catch {
     console.log(message)
   }
 })
 
+swarm.on('connection', (connection) => store.replicate(connection))
+swarm.join(topicForAll, {
+  client: true,
+  server: true
+})
+
 pipe.write('Hello from worker')
+
+async function handlePoll(pollOperation) {
+  if (pollOperation.cmd === 'create') {
+    base.append({ type: 'create-poll', id: 123, data: { ...pollOperation.data, id: 123 } })
+  } else if (pollOperation.cmd === 'get-all') {
+    sendAllPolls()
+  }
+}
+
+async function handleComment(commentOperation) {
+
+}
+
+async function sendAllPolls() {
+
+  const pollsStream = base.view.createReadStream({
+    gte: 'polls/',
+    lte: 'polls/\xff'
+  })
+
+  const results = {}
+  for await (const { key, value } of pollsStream) {
+    const poll = JSON.parse(value)
+    results[poll.id] = poll
+  }
+
+  pipe.write(JSON.stringify({ type: 'polls', data: results }))
+}
