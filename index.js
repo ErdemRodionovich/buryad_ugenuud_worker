@@ -85,7 +85,7 @@ goodbye(async () => {
   await store.close()
 })
 
-await base.ready()
+base.ready()
 
 pipe.on('data', async (data) => {
   const message = data.toString()
