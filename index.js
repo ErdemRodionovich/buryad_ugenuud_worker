@@ -135,19 +135,22 @@ async function handleComment(commentOperation) {
 }
 
 async function sendAllPolls() {
+  try {
+    const pollsStream = base.view.createReadStream({
+      gte: 'polls/',
+      lte: 'polls/\xff'
+    })
 
-  const pollsStream = base.view.createReadStream({
-    gte: 'polls/',
-    lte: 'polls/\xff'
-  })
+    const results = {}
+    for await (const { key, value } of pollsStream) {
+      const poll = JSON.parse(value)
+      results[poll.id] = poll
+    }
 
-  const results = {}
-  for await (const { key, value } of pollsStream) {
-    const poll = JSON.parse(value)
-    results[poll.id] = poll
+    pipe.write(JSON.stringify({ type: 'polls', data: results }))
+  } catch (err) {
+    pipe.write(JSON.stringify({ type: 'error', msg: err.message }))
   }
-
-  pipe.write(JSON.stringify({ type: 'polls', data: results }))
 }
 
 console.log('worker: after all')
