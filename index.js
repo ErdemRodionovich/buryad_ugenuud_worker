@@ -1,3 +1,4 @@
+console.log('worker is starting')
 const PearRuntime = require('pear-runtime') // pear-runtime on desktop; pear-mobile on mobile
 const Hyperswarm = require('hyperswarm')
 const Corestore = require('corestore')
@@ -10,6 +11,8 @@ const Autobase = require('autobase')
 const Hyperbee = require('hyperbee')
 const crypto = require('hypercore-crypto')
 
+
+console.log('worker: after requires')
 // mobile doesn't have the executable path (argv[0])
 // and the worker entry path (argv[1]) in the workers argv‘s
 // ... to reuse the same worker in all platforms this logic is needed
@@ -31,6 +34,8 @@ const store = new Corestore(path.join(updaterConfig.dir, 'app-storage', 'bee'))
 const swarm = new Hyperswarm()
 const pear = new PearRuntime({ ...updaterConfig, swarm: updater_swarm, store: updater_store })
 const topicForAll = crypto.data(Buffer.from('anyone'))
+
+console.log('worker: after consts')
 
 pear.updater.on('error', console.error)
 if (updaterConfig.updates !== false) {
@@ -70,6 +75,8 @@ const base = new Autobase(store, null, {
   }
 })
 
+console.log('worker: after base')
+
 goodbye(async () => {
   await updater_swarm.destroy()
   await swarm.destroy()
@@ -103,6 +110,8 @@ pipe.on('data', async (data) => {
   }
 })
 
+console.log('worker: after pipe on data subscription')
+
 swarm.on('connection', (connection) => store.replicate(connection))
 swarm.join(topicForAll, {
   client: true,
@@ -110,6 +119,8 @@ swarm.join(topicForAll, {
 })
 
 pipe.write('Hello from worker')
+
+console.log('worker: after pipe hello')
 
 async function handlePoll(pollOperation) {
   if (pollOperation.cmd === 'create') {
@@ -138,3 +149,5 @@ async function sendAllPolls() {
 
   pipe.write(JSON.stringify({ type: 'polls', data: results }))
 }
+
+console.log('worker: after all')
