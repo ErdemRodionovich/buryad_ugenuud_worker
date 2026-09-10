@@ -6,10 +6,8 @@ const goodbye = require('graceful-goodbye')
 const FramedStream = require('framed-stream')
 const path = require('bare-path')
 const dir = require('bare-storage')
-const { isBareKit } = require('which-runtime')
 const Autobase = require('autobase')
 const Hyperbee = require('hyperbee')
-const crypto = require('hypercore-crypto')
 
 const b4a = require('b4a')
 
@@ -44,11 +42,6 @@ function sendError(error) {
 }
 
 console.log('worker: after requires')
-// mobile doesn't have the executable path (argv[0])
-// and the worker entry path (argv[1]) in the workers argv‘s
-// ... to reuse the same worker in all platforms this logic is needed
-const argv = (index) => Bare.argv[index + (isBareKit ? 0 : 2)]
-
 function parseArgs(argsArray) {
   const flags = { _: [] }
   // Slice off the entry script path (index 0)
@@ -97,7 +90,12 @@ const updater_swarm = new Hyperswarm()
 const store = new Corestore(path.join(updaterConfig.dir, 'app-storage', 'bee'))
 const swarm = new Hyperswarm()
 const pear = new PearRuntime({ ...updaterConfig, swarm: updater_swarm, store: updater_store })
-const topicForAll = crypto.data(Buffer.from('anyone'))
+const pollKey = argsParsed['poll-key'] || argsParsed.pollKey
+if (!/^[0-9a-f]{64}$/i.test(pollKey || '')) {
+  throw new Error('poll-key must be a 32-byte hexadecimal Autobase key')
+}
+const sharedBootstrapKey = b4a.from(pollKey, 'hex')
+const peers = new Set()
 
 console.log('worker: after consts')
 
@@ -116,20 +114,27 @@ pear.updater.on('updating', () => pipe.write('updating'))
 pear.updater.on('updated', () => pipe.write('updated'))
 pear.on('minver-required', () => pipe.write('minver-required')) // for mobile store update notification
 
-const base = new Autobase(store, null, {
+const base = new Autobase(store, sharedBootstrapKey, {
+  optimistic: true,
   apply: async (batch, view, host) => {
     for (const node of batch) {
       const op = decodePayload(node.value)
-
-      //verify block here
+      if (!op) continue
+      const author = keyId(node.from.key)
 
       await host.ackWriter(node.from.key)
       if (op.type === 'create-poll') {
-        await view.put(`polls/${op.id}`, JSON.stringify(op.data))
+        await view.put(
+          `polls/${op.id}`,
+          JSON.stringify({ ...op.data, id: op.id, creator: author, closed: false })
+        )
       } else if (op.type === 'cast-vote') {
-        await view.put(`votes/${op.pollId}/${op.author}`, JSON.stringify(op.data))
+        await view.put(`votes/${op.pollId}/${author}`, JSON.stringify(op.data))
       } else if (op.type === 'close-poll') {
-        await view.put(`polls/${op.pollId}/closed`, 'true')
+        const entry = await view.get(`polls/${op.pollId}`)
+        if (entry && JSON.parse(entry.value).creator === author) {
+          await view.put(`polls/${op.pollId}/closed`, 'true')
+        }
       } else if (op.type === 'add-comment') {
         await view.put(
           `comments/${op.pollId}/${op.timestamp}-${op.author}`,
@@ -145,6 +150,33 @@ const base = new Autobase(store, null, {
 })
 
 console.log('worker: after base')
+
+async function startReplication() {
+  await base.ready()
+
+  console.log('Application base discovery key:', b4a.toString(base.discoveryKey, 'hex'))
+  sendPeerCount()
+  base.on('update', () => sendAllPolls().catch(sendError))
+  swarm.on('connection', (connection) => {
+    peers.add(connection)
+    console.log('Application peer connected')
+    sendPeerCount()
+    connection.once('close', () => {
+      peers.delete(connection)
+      console.log('Application peer disconnected')
+      sendPeerCount()
+    })
+    store.replicate(connection)
+  })
+  swarm.join(base.discoveryKey, {
+    client: true,
+    server: true
+  })
+}
+
+function sendPeerCount() {
+  pipe.write(JSON.stringify({ type: 'peers', data: peers.size }))
+}
 
 goodbye(async () => {
   await updater_swarm.destroy()
@@ -183,11 +215,7 @@ pipe.on('data', async (data) => {
 
 console.log('worker: after pipe on data subscription')
 
-swarm.on('connection', (connection) => store.replicate(connection))
-swarm.join(topicForAll, {
-  client: true,
-  server: true
-})
+startReplication().catch(sendError)
 
 pipe.write('Hello from worker')
 
@@ -203,8 +231,9 @@ async function handlePoll(pollOperation) {
       const options = Array.isArray(pollOperation.poll?.options)
         ? pollOperation.poll.options.map((option) => String(option).trim()).filter(Boolean)
         : []
-      if (!question || options.length < 2)
+      if (!question || options.length < 2) {
         throw new Error('A poll needs a question and at least two options')
+      }
 
       const id = `${Date.now()}-${author.slice(0, 12)}`
       await base.append(
@@ -212,7 +241,8 @@ async function handlePoll(pollOperation) {
           type: 'create-poll',
           id,
           data: { id, question, options, creator: author, closed: false, createdAt: Date.now() }
-        })
+        }),
+        { optimistic: true }
       )
       await sendAllPolls()
     } else if (pollOperation.cmd === 'vote') {
@@ -233,14 +263,19 @@ async function handlePoll(pollOperation) {
           pollId: poll.id,
           author,
           data: { optionIndex: pollOperation.optionIndex, createdAt: Date.now() }
-        })
+        }),
+        { optimistic: true }
       )
       await sendAllPolls()
     } else if (pollOperation.cmd === 'close') {
       const poll = await getPoll(pollOperation.pollId)
       if (!poll) throw new Error('Poll not found')
       if (poll.creator !== author) throw new Error('Only the poll creator can close voting')
-      if (!poll.closed) await base.append(encodePayload({ type: 'close-poll', pollId: poll.id }))
+      if (!poll.closed) {
+        await base.append(encodePayload({ type: 'close-poll', pollId: poll.id }), {
+          optimistic: true
+        })
+      }
       await sendAllPolls()
     } else if (pollOperation.cmd === 'get-all') {
       await sendAllPolls()
@@ -250,7 +285,7 @@ async function handlePoll(pollOperation) {
   }
 }
 
-async function handleComment(commentOperation) { }
+function handleComment(commentOperation) { }
 
 async function sendAllPolls() {
   await base.ready()
