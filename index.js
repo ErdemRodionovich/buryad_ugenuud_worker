@@ -35,6 +35,14 @@ function decodePayload(buffer) {
   }
 }
 
+function keyId(key) {
+  return b4a.toString(key, 'hex')
+}
+
+function sendError(error) {
+  pipe.write(JSON.stringify({ type: 'error', data: error.message || String(error) }))
+}
+
 console.log('worker: after requires')
 // mobile doesn't have the executable path (argv[0])
 // and the worker entry path (argv[1]) in the workers argv‘s
@@ -120,8 +128,13 @@ const base = new Autobase(store, null, {
         await view.put(`polls/${op.id}`, JSON.stringify(op.data))
       } else if (op.type === 'cast-vote') {
         await view.put(`votes/${op.pollId}/${op.author}`, JSON.stringify(op.data))
+      } else if (op.type === 'close-poll') {
+        await view.put(`polls/${op.pollId}/closed`, 'true')
       } else if (op.type === 'add-comment') {
-        await view.put(`comments/${op.pollId}/${op.timestamp}-${op.author}`, JSON.stringify(op.data))
+        await view.put(
+          `comments/${op.pollId}/${op.timestamp}-${op.author}`,
+          JSON.stringify(op.data)
+        )
       }
     }
   },
@@ -181,32 +194,66 @@ pipe.write('Hello from worker')
 console.log('worker: after pipe hello')
 
 async function handlePoll(pollOperation) {
-  //try {
-  if (pollOperation.cmd === 'create') {
-    if (!base) {
-      pipe.write(JSON.stringify({ type: 'error', data: "base is not set!" }))
-      return
+  try {
+    await base.ready()
+    const author = keyId(base.local.key)
+
+    if (pollOperation.cmd === 'create') {
+      const question = String(pollOperation.poll?.question || '').trim()
+      const options = Array.isArray(pollOperation.poll?.options)
+        ? pollOperation.poll.options.map((option) => String(option).trim()).filter(Boolean)
+        : []
+      if (!question || options.length < 2)
+        throw new Error('A poll needs a question and at least two options')
+
+      const id = `${Date.now()}-${author.slice(0, 12)}`
+      await base.append(
+        encodePayload({
+          type: 'create-poll',
+          id,
+          data: { id, question, options, creator: author, closed: false, createdAt: Date.now() }
+        })
+      )
+      await sendAllPolls()
+    } else if (pollOperation.cmd === 'vote') {
+      const poll = await getPoll(pollOperation.pollId)
+      if (!poll) throw new Error('Poll not found')
+      if (poll.closed) throw new Error('Voting is closed')
+      if (
+        !Number.isInteger(pollOperation.optionIndex) ||
+        pollOperation.optionIndex < 0 ||
+        pollOperation.optionIndex >= poll.options.length
+      ) {
+        throw new Error('Choose a valid option')
+      }
+      if (await getVote(poll.id, author)) throw new Error('You have already voted in this poll')
+      await base.append(
+        encodePayload({
+          type: 'cast-vote',
+          pollId: poll.id,
+          author,
+          data: { optionIndex: pollOperation.optionIndex, createdAt: Date.now() }
+        })
+      )
+      await sendAllPolls()
+    } else if (pollOperation.cmd === 'close') {
+      const poll = await getPoll(pollOperation.pollId)
+      if (!poll) throw new Error('Poll not found')
+      if (poll.creator !== author) throw new Error('Only the poll creator can close voting')
+      if (!poll.closed) await base.append(encodePayload({ type: 'close-poll', pollId: poll.id }))
+      await sendAllPolls()
+    } else if (pollOperation.cmd === 'get-all') {
+      await sendAllPolls()
     }
-    await base.append(encodePayload({ type: 'create-poll', id: 123, data: { ...pollOperation.poll, id: 123 } }))
-  } else if (pollOperation.cmd === 'get-all') {
-    sendAllPolls()
+  } catch (error) {
+    sendError(error)
   }
-  // } catch (err) {
-  //   const errorMessage = error instanceof Error ? error.message : String(error)
-  //   pipe.write(JSON.stringify({ type: 'error', data: errorMessage }))
-  // }
 }
 
-async function handleComment(commentOperation) {
-
-}
+async function handleComment(commentOperation) { }
 
 async function sendAllPolls() {
-  //try {
-  if (!base.view) {
-    pipe.write(JSON.stringify({ type: 'error', data: "base.view is not set!" }))
-    return
-  }
+  await base.ready()
 
   const pollsStream = base.view.createReadStream({
     gte: 'polls/',
@@ -215,15 +262,40 @@ async function sendAllPolls() {
 
   const results = {}
   for await (const { key, value } of pollsStream) {
+    if (key.includes('/closed')) continue
     const poll = JSON.parse(value)
+    poll.votes = await getPollResults(poll.id)
     results[poll.id] = poll
   }
 
   pipe.write(JSON.stringify({ type: 'polls', data: results }))
-  // } catch (err) {
-  //   const errorMessage = error instanceof Error ? error.message : String(error)
-  //   pipe.write(JSON.stringify({ type: 'error', data: errorMessage }))
-  // }
+}
+
+async function getPoll(pollId) {
+  await base.ready()
+  const entry = await base.view.get(`polls/${pollId}`)
+  if (!entry) return null
+  const poll = JSON.parse(entry.value)
+  poll.closed = (await base.view.get(`polls/${pollId}/closed`)) !== null
+  poll.votes = await getPollResults(pollId)
+  return poll
+}
+
+async function getVote(pollId, author) {
+  return (await base.view.get(`votes/${pollId}/${author}`)) !== null
+}
+
+async function getPollResults(pollId) {
+  const results = {}
+  const stream = base.view.createReadStream({
+    gte: `votes/${pollId}/`,
+    lte: `votes/${pollId}/\xff`
+  })
+  for await (const { value } of stream) {
+    const vote = JSON.parse(value)
+    results[vote.optionIndex] = (results[vote.optionIndex] || 0) + 1
+  }
+  return results
 }
 
 console.log('worker: after all')
