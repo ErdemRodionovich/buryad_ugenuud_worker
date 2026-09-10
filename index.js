@@ -146,7 +146,13 @@ function languageApply(batch, view, host) {
       if (!op) continue
       const author = keyId(node.from.key)
 
-      await host.ackWriter(node.from.key)
+      if (op.type === 'language-join') {
+        await host.addWriter(b4a.from(op.writer, 'hex'), { indexer: false, isIndexer: false })
+        await host.ackWriter(node.from.key)
+      } else {
+        await host.ackWriter(node.from.key)
+      }
+
       if (op.type === 'language-meta') {
         await view.put(
           'language/meta',
@@ -201,8 +207,15 @@ async function openLanguage(metadata, bootstrap, keyPair = null) {
       sendAllPolls(context).catch(sendError)
     }
   })
-  for (const connection of connections) context.store.replicate(connection)
+  for (const connection of connections) context.base.replicate(connection)
   swarm.join(base.discoveryKey, { client: true, server: true })
+  if (bootstrap && !(await base.local.getUserData('language/joined'))) {
+    await base.append(encodePayload({ type: 'language-join', writer: keyId(base.local.key) }), {
+      optimistic: true
+    })
+    await base.local.setUserData('language/joined', b4a.from('1'))
+  }
+  await base.update()
   return context
 }
 
@@ -300,7 +313,10 @@ swarm.on('connection', (connection) => {
     console.log('Application peer disconnected')
     sendPeerCount()
   })
-  for (const context of languages.values()) context.store.replicate(connection)
+  for (const context of languages.values()) {
+    context.base.replicate(connection)
+    context.base.update().catch(sendError)
+  }
 })
 
 async function startReplication() {
