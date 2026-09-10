@@ -11,6 +11,7 @@ const Hyperbee = require('hyperbee')
 const crypto = require('hypercore-crypto')
 
 const b4a = require('b4a')
+const maxMediaBytes = 10 * 1024 * 1024
 
 function encodePayload(data) {
   if (data === undefined || data === null) {
@@ -375,6 +376,51 @@ pipe.write('Hello from worker')
 
 console.log('worker: after pipe hello')
 
+function normalizeMedia(media) {
+  if (!media || media.type === 'none' || (!media.url && !media.data)) return null
+  if (media.data) {
+    const data = String(media.data)
+    const bytes = b4a.from(data, 'base64')
+    if (bytes.byteLength > maxMediaBytes) throw new Error('Media file must be 10 MB or smaller')
+    const mime = String(media.mime || '')
+    if (!mime.startsWith('image/') && !mime.startsWith('video/')) {
+      throw new Error('Media type does not match the selected file')
+    }
+    return {
+      data,
+      mime,
+      name: String(media.name || '')
+    }
+  }
+  if (media.type !== 'image' && media.type !== 'video') {
+    throw new Error('Media must be an image or video')
+  }
+  const url = String(media.url).trim()
+  let parsedUrl
+  try {
+    parsedUrl = new URL(url)
+  } catch {
+    throw new Error('Media URL is invalid')
+  }
+  if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') {
+    throw new Error('Media URL must use http or https')
+  }
+  return { type: media.type, url }
+}
+
+function normalizeMediaList(media) {
+  const mediaItems = Array.isArray(media) ? media : media ? [media] : []
+  return mediaItems.map(normalizeMedia).filter(Boolean)
+}
+
+function normalizeOption(option) {
+  if (typeof option === 'string') return { text: option.trim(), media: [] }
+  return {
+    text: String(option?.text || '').trim(),
+    media: normalizeMediaList(option?.media)
+  }
+}
+
 async function handlePoll(pollOperation) {
   try {
     const context = languages.get(pollOperation.languageId || activeLanguageId)
@@ -385,8 +431,9 @@ async function handlePoll(pollOperation) {
 
     if (pollOperation.cmd === 'create') {
       const question = String(pollOperation.poll?.question || '').trim()
+      const questionMedia = normalizeMediaList(pollOperation.poll?.questionMedia)
       const options = Array.isArray(pollOperation.poll?.options)
-        ? pollOperation.poll.options.map((option) => String(option).trim()).filter(Boolean)
+        ? pollOperation.poll.options.map(normalizeOption).filter((option) => option.text)
         : []
       if (!question || options.length < 2) {
         throw new Error('A poll needs a question and at least two options')
@@ -397,7 +444,15 @@ async function handlePoll(pollOperation) {
         encodePayload({
           type: 'create-poll',
           id,
-          data: { id, question, options, creator: author, closed: false, createdAt: Date.now() }
+          data: {
+            id,
+            question,
+            questionMedia,
+            options,
+            creator: author,
+            closed: false,
+            createdAt: Date.now()
+          }
         }),
         { optimistic: true }
       )
