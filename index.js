@@ -5,6 +5,7 @@ const Corestore = require('corestore')
 const goodbye = require('graceful-goodbye')
 const FramedStream = require('framed-stream')
 const path = require('bare-path')
+const fs = require('bare-fs')
 const dir = require('bare-storage')
 const Autobase = require('autobase')
 const Hyperbee = require('hyperbee')
@@ -37,6 +38,15 @@ function decodePayload(buffer) {
 
 function keyId(key) {
   return b4a.toString(key, 'hex')
+}
+
+function enqueueLanguage(context, operation) {
+  const previous = context.operationQueue
+  let release
+  context.operationQueue = new Promise((resolve) => {
+    release = resolve
+  })
+  return previous.then(operation).finally(release)
 }
 
 function sendError(error) {
@@ -136,7 +146,11 @@ async function writeLanguageRegistry() {
   await registryStore.ready()
   await registryView.ready()
   for (const language of languages.values()) {
-    await registryView.put(`languages/${language.key}`, { key: language.key })
+    const op = { key: language.key }
+    if (language.storageFolder && language.storageFolder !== language.key)
+      op.storageFolder = language.storageFolder
+    await registryView.put(`languages/${language.key}`, op)
+    console.log('wrote language, key: ', language.key, ' storageFolder:', language.storageFolder)
   }
 }
 
@@ -186,7 +200,10 @@ function languageOpen(store) {
 async function openLanguage(metadata, bootstrap, keyPair = null) {
   const languageKey = metadata.key || (keyPair && keyId(keyPair.publicKey))
   if (!languageKey) throw new Error('Language key is required')
-  const languageStore = new Corestore(path.join(languageDirectory, languageKey))
+  let storageFolder = languageKey
+  if (metadata.storageFolder && fs.existsSync(path.join(languageDirectory, metadata.storageFolder)))
+    storageFolder = metadata.storageFolder
+  const languageStore = new Corestore(path.join(languageDirectory, storageFolder))
   const baseOptions = {
     optimistic: true,
     apply: languageApply,
@@ -194,20 +211,34 @@ async function openLanguage(metadata, bootstrap, keyPair = null) {
   }
   if (keyPair) baseOptions.keyPair = keyPair
   const base = new Autobase(languageStore, bootstrap, baseOptions)
-  const context = { id: languageKey, key: languageKey, base, store: languageStore }
+  const context = {
+    id: languageKey,
+    key: languageKey,
+    base,
+    store: languageStore,
+    operationQueue: Promise.resolve()
+  }
   await base.ready()
 
   context.key = b4a.toString(base.key, 'hex')
   context.id = context.key
+  context.storageFolder = storageFolder
   const metaEntry = await base.view.get('language/meta')
   if (metaEntry) Object.assign(context, JSON.parse(metaEntry.value))
+  console.log(
+    'opened language, id: ',
+    context.id,
+    ' key:',
+    context.key,
+    ' name:',
+    context.name,
+    ' description:',
+    context.description,
+    ' metaEntry:',
+    metaEntry
+  )
   languages.set(context.id, context)
-  base.on('update', () => {
-    if (activeLanguageId === context.id) {
-      refreshLanguageMetadata(context).catch(sendError)
-      sendAllPolls(context).catch(sendError)
-    }
-  })
+
   for (const connection of connections) context.base.replicate(connection)
   swarm.join(base.discoveryKey, { client: true, server: true })
   if (bootstrap && !(await base.local.getUserData('language/joined'))) {
@@ -216,7 +247,14 @@ async function openLanguage(metadata, bootstrap, keyPair = null) {
     })
     await base.local.setUserData('language/joined', b4a.from('1'))
   }
-  await base.update()
+  base.on('update', () => {
+    if (activeLanguageId === context.id) {
+      enqueueLanguage(context, async () => {
+        await refreshLanguageMetadata(context)
+        await sendAllPollsUnlocked(context)
+      }).catch(sendError)
+    }
+  })
   return context
 }
 
@@ -229,7 +267,10 @@ async function refreshLanguageMetadata(context) {
 
 async function loadLanguages() {
   for (const metadata of await readLanguageRegistry()) {
-    if (!/^[0-9a-f]{64}$/i.test(metadata.key || '')) continue
+    if (!/^[0-9a-f]{64}$/i.test(metadata.key || '')) {
+      console.log('skipping language: ', JSON.stringify(metadata))
+      continue
+    }
     const context = await openLanguage(metadata, b4a.from(metadata.key, 'hex'))
     if (!activeLanguageId) activeLanguageId = context.id
   }
@@ -253,9 +294,10 @@ async function createLanguage(data) {
   if (!name) throw new Error('Language name is required')
   const keyPair = crypto.keyPair()
   const context = await openLanguage({}, null, keyPair)
-  await context.base.append(encodePayload({ type: 'language-meta', name, description }), {
-    optimistic: true
-  })
+  await context.base.append(encodePayload({ type: 'language-meta', name, description }))
+  await context.base.update()
+  await context.base.flush()
+  await context.base.local.setUserData('language/joined', b4a.from('1'))
   context.name = name
   context.description = description
   languages.set(context.id, context)
@@ -316,7 +358,7 @@ swarm.on('connection', (connection) => {
   })
   for (const context of languages.values()) {
     context.base.replicate(connection)
-    context.base.update().catch(sendError)
+    enqueueLanguage(context, () => context.base.update()).catch(sendError)
   }
 })
 
@@ -422,9 +464,13 @@ function normalizeOption(option) {
 }
 
 async function handlePoll(pollOperation) {
+  const context = languages.get(pollOperation.languageId || activeLanguageId)
+  if (!context) return sendError(new Error('Select or join a language first'))
+  return enqueueLanguage(context, () => handlePollUnlocked(pollOperation, context))
+}
+
+async function handlePollUnlocked(pollOperation, context) {
   try {
-    const context = languages.get(pollOperation.languageId || activeLanguageId)
-    if (!context) throw new Error('Select or join a language first')
     const { base } = context
     await base.ready()
     const author = keyId(base.local.key)
@@ -456,9 +502,9 @@ async function handlePoll(pollOperation) {
         }),
         { optimistic: true }
       )
-      await sendAllPolls(context)
+      await sendAllPollsUnlocked(context)
     } else if (pollOperation.cmd === 'vote') {
-      const poll = await getPoll(context, pollOperation.pollId)
+      const poll = await getPollUnlocked(context, pollOperation.pollId)
       if (!poll) throw new Error('Poll not found')
       if (poll.closed) throw new Error('Voting is closed')
       if (
@@ -468,7 +514,7 @@ async function handlePoll(pollOperation) {
       ) {
         throw new Error('Choose a valid option')
       }
-      if (await getVote(context, poll.id, author)) {
+      if (await getVoteUnlocked(context, poll.id, author)) {
         throw new Error('You have already voted in this poll')
       }
       await base.append(
@@ -480,9 +526,9 @@ async function handlePoll(pollOperation) {
         }),
         { optimistic: true }
       )
-      await sendAllPolls(context)
+      await sendAllPollsUnlocked(context)
     } else if (pollOperation.cmd === 'close') {
-      const poll = await getPoll(context, pollOperation.pollId)
+      const poll = await getPollUnlocked(context, pollOperation.pollId)
       if (!poll) throw new Error('Poll not found')
       if (poll.creator !== author) throw new Error('Only the poll creator can close voting')
       if (!poll.closed) {
@@ -490,9 +536,9 @@ async function handlePoll(pollOperation) {
           optimistic: true
         })
       }
-      await sendAllPolls(context)
+      await sendAllPollsUnlocked(context)
     } else if (pollOperation.cmd === 'get-all') {
-      await sendAllPolls(context)
+      await sendAllPollsUnlocked(context)
     }
   } catch (error) {
     sendError(error)
@@ -502,7 +548,12 @@ async function handlePoll(pollOperation) {
 function handleComment(commentOperation) { }
 
 async function sendAllPolls(context) {
+  return enqueueLanguage(context, () => sendAllPollsUnlocked(context))
+}
+
+async function sendAllPollsUnlocked(context) {
   await context.base.ready()
+  await context.base.update()
 
   const pollsStream = context.base.view.createReadStream({
     gte: 'polls/',
@@ -513,7 +564,7 @@ async function sendAllPolls(context) {
   for await (const { key, value } of pollsStream) {
     if (key.includes('/closed')) continue
     const poll = JSON.parse(value)
-    poll.votes = await getPollResults(context, poll.id)
+    poll.votes = await getPollResultsUnlocked(context, poll.id)
     results[poll.id] = poll
   }
 
@@ -521,20 +572,32 @@ async function sendAllPolls(context) {
 }
 
 async function getPoll(context, pollId) {
+  return enqueueLanguage(context, () => getPollUnlocked(context, pollId))
+}
+
+async function getPollUnlocked(context, pollId) {
   await context.base.ready()
   const entry = await context.base.view.get(`polls/${pollId}`)
   if (!entry) return null
   const poll = JSON.parse(entry.value)
   poll.closed = (await context.base.view.get(`polls/${pollId}/closed`)) !== null
-  poll.votes = await getPollResults(context, pollId)
+  poll.votes = await getPollResultsUnlocked(context, pollId)
   return poll
 }
 
 async function getVote(context, pollId, author) {
+  return enqueueLanguage(context, () => getVoteUnlocked(context, pollId, author))
+}
+
+async function getVoteUnlocked(context, pollId, author) {
   return (await context.base.view.get(`votes/${pollId}/${author}`)) !== null
 }
 
 async function getPollResults(context, pollId) {
+  return enqueueLanguage(context, () => getPollResultsUnlocked(context, pollId))
+}
+
+async function getPollResultsUnlocked(context, pollId) {
   const results = {}
   const stream = context.base.view.createReadStream({
     gte: `votes/${pollId}/`,
