@@ -356,7 +356,7 @@ function saveTranslationAPI_Details(details) {
 async function saveTranslationAPI_DetailsUnlocked(details, context) {
   try {
     const { base } = context
-    const { yKey, yFolderID } = details
+    const { yKey, yFolderID, gKey, gProjectID } = details
     await base.ready()
     // check for privileges
     const meta = await metaOfLanguage(context)
@@ -367,7 +367,9 @@ async function saveTranslationAPI_DetailsUnlocked(details, context) {
             type: 'save-translation-api-details',
             data: {
               yKey,
-              yFolderID
+              yFolderID,
+              gKey,
+              gProjectID
             }
           }
         ),
