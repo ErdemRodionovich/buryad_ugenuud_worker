@@ -171,7 +171,7 @@ function languageApply(batch, view, host) {
       if (op.type === 'language-meta') {
         await view.put(
           'language/meta',
-          JSON.stringify({ name: op.name, description: op.description })
+          JSON.stringify({ name: op.name, description: op.description, creator: op.creator })
         )
       } else if (op.type === 'create-poll') {
         await view.put(
@@ -185,6 +185,8 @@ function languageApply(batch, view, host) {
         if (entry && JSON.parse(entry.value).creator === author) {
           await view.put(`polls/${op.pollId}/closed`, 'true')
         }
+      } else if (op.type === 'save-translation-api-details') {
+        await view.put('language/translation_api_details', JSON.stringify(op.data))
       }
     }
   })()
@@ -223,20 +225,8 @@ async function openLanguage(metadata, bootstrap, keyPair = null) {
   context.key = b4a.toString(base.key, 'hex')
   context.id = context.key
   context.storageFolder = storageFolder
-  const metaEntry = await base.view.get('language/meta')
-  if (metaEntry) Object.assign(context, JSON.parse(metaEntry.value))
-  console.log(
-    'opened language, id: ',
-    context.id,
-    ' key:',
-    context.key,
-    ' name:',
-    context.name,
-    ' description:',
-    context.description,
-    ' metaEntry:',
-    metaEntry
-  )
+  const metaEntry = await metaOfLanguage(context)
+  if (metaEntry) Object.assign(context, metaEntry)
   languages.set(context.id, context)
 
   for (const connection of connections) context.base.replicate(connection)
@@ -258,10 +248,17 @@ async function openLanguage(metadata, bootstrap, keyPair = null) {
   return context
 }
 
-async function refreshLanguageMetadata(context) {
+async function metaOfLanguage(context) {
   const entry = await context.base.view.get('language/meta')
-  if (!entry) return
-  Object.assign(context, JSON.parse(entry.value))
+  if (!entry) return null
+  return JSON.parse(entry.value)
+}
+
+async function refreshLanguageMetadata(context) {
+  const meta = metaOfLanguage(context)
+  if (meta) {
+    Object.assign(context, meta)
+  }
   sendLanguages()
 }
 
@@ -283,7 +280,19 @@ function sendLanguages() {
     JSON.stringify({
       type: 'languages',
       active: activeLanguageId,
-      data: [...languages.values()].map(({ base, store, ...metadata }) => metadata)
+      data: [...languages.values()].map(({ base, store, ...metadata }) => {
+        const { id, key, storageFolder, name, description, creator } = metadata
+        const isOwner = (creator === keyId(base.local.key))
+        return {
+          id,
+          key,
+          storageFolder,
+          name,
+          description,
+          creator,
+          isOwner
+        }
+      })
     })
   )
 }
@@ -294,7 +303,7 @@ async function createLanguage(data) {
   if (!name) throw new Error('Language name is required')
   const keyPair = crypto.keyPair()
   const context = await openLanguage({}, null, keyPair)
-  await context.base.append(encodePayload({ type: 'language-meta', name, description }))
+  await context.base.append(encodePayload({ type: 'language-meta', name, description, creator: keyId(context.base.local.key) }))
   await context.base.update()
   await context.base.flush()
   await context.base.local.setUserData('language/joined', b4a.from('1'))
@@ -334,7 +343,65 @@ function selectLanguage(id) {
   if (!languages.has(id)) throw new Error('Language not found')
   activeLanguageId = id
   sendLanguages()
+  sendTranslationAPI_Details(languages.get(id))
   return sendAllPolls(languages.get(id))
+}
+
+function saveTranslationAPI_Details(details) {
+  const context = languages.get(details.languageId || activeLanguageId)
+  if (!context) return sendError(new Error('Select or join a language first'))
+  return enqueueLanguage(context, () => saveTranslationAPI_DetailsUnlocked(details, context))
+}
+
+async function saveTranslationAPI_DetailsUnlocked(details, context) {
+  try {
+    const { base } = context
+    const { yKey, yFolderID } = details
+    await base.ready()
+    // check for privileges
+    const meta = await metaOfLanguage(context)
+    if (meta && meta.creator === keyId(base.local.key)) {
+      base.append(
+        encodePayload(
+          {
+            type: 'save-translation-api-details',
+            data: {
+              yKey,
+              yFolderID
+            }
+          }
+        ),
+        { optimistic: true }
+      )
+    } else if (!meta) {
+      console.log('Cannot save Translation API details! NO meta!')
+    } else {
+      console.log('Cannot save Translation API details! not creator')
+    }
+  } catch (error) {
+    sendError(error)
+  }
+}
+
+async function sendTranslationAPI_Details(context) {
+  return enqueueLanguage(context, () => sendTranslationAPI_DetailsUnlocked(context))
+}
+
+async function sendTranslationAPI_DetailsUnlocked(context) {
+  await context.base.ready()
+  const detailsEntry = await context.base.view.get('language/translation_api_details')
+  if (detailsEntry) {
+    const details = JSON.parse(detailsEntry.value)
+    pipe.write(JSON.stringify(
+      {
+        type: 'translation-api-details',
+        data: {
+          ...details,
+          languageId: context.id
+        }
+      }
+    ))
+  }
 }
 
 function handleLanguage(operation) {
@@ -342,6 +409,7 @@ function handleLanguage(operation) {
   if (operation.cmd === 'join') return joinLanguage(operation)
   if (operation.cmd === 'select') return selectLanguage(operation.id)
   if (operation.cmd === 'list') return sendLanguages()
+  if (operation.cmd === 'saveAPI_Details') return saveTranslationAPI_Details(operation)
   throw new Error('Unknown language command')
 }
 
@@ -380,8 +448,6 @@ goodbye(async () => {
   await registryStore.close()
   for (const context of languages.values()) await context.store.close()
 })
-
-//base.ready()
 
 pipe.on('data', async (data) => {
   const message = data.toString()
