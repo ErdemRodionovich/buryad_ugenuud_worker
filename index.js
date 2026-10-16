@@ -189,6 +189,8 @@ function languageApply(batch, view, host) {
         await view.put('language/translation_api_details', JSON.stringify(op.data))
       } else if (op.type === 'save-translation') {
         await view.put(`translations/${op.data.translationID}`, JSON.stringify(op.data))
+      } else if (op.type === 'remove-translation') {
+        await view.del(`translations/${op.data.translationID}`)
       } else if (op.type === 'link-translation') {
         await linkTranslation(view, op.data)
       }
@@ -217,17 +219,25 @@ async function linkTranslation(view, translation) {
     const oldWords = JSON.parse(entry.value)
     for (const old of oldWords) {
       if (!translation.words.includes(old)) {
-        const entryOfOld = view.get(`words/${old}/${translation.language}`)
+        const entryOfOld = await view.get(`words/${old}/${translation.language}`)
         if (entryOfOld) {
           const ids = JSON.parse(entryOfOld.value)
           const without = ids.filter((i) => i !== translation.translationID)
-          await view.put(`words/${old}/${translation.language}`, JSON.stringify(without))
+          if (without.length > 0) {
+            await view.put(`words/${old}/${translation.language}`, JSON.stringify(without))
+          } else {
+            await view.del(`words/${old}/${translation.language}`)
+          }
         }
       }
     }
   }
 
-  await view.put(`translations-to-words/${translation.translationID}`, JSON.stringify(translation.words))
+  if (translation.words.length > 0) {
+    await view.put(`translations-to-words/${translation.translationID}`, JSON.stringify(translation.words))
+  } else {
+    await view.del(`translations-to-words/${translation.translationID}`)
+  }
 }
 
 function languageOpen(store) {
@@ -729,6 +739,10 @@ async function handleTranslation(translation) {
 async function handleTranslationUnlocked(context, translation) {
   if (translation.cmd === 'save') {
     return await saveTranslationUnlocked(context, translation)
+  } else if (translation.cmd === 'get-for-edit') {
+    return await getTranslationForEditUnlocked(context, translation)
+  } else if (translation.cmd === 'remove') {
+    return await removeTranslationUnlocked(context, translation)
   }
 }
 
@@ -778,6 +792,72 @@ function guid() {
 
   const hex = Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('')
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
+}
+
+async function getTranslationForEditUnlocked(context, translation) {
+  try {
+    const { base } = context
+    const entry = await base.view.get(`translations/${translation.translationID}`)
+    if (entry) {
+      const translationData = JSON.parse(entry.value)
+      const wordsEntry = await base.view.get(`translations-to-words/${translation.translationID}`)
+      if (wordsEntry) {
+        const words = JSON.parse(wordsEntry.value)
+        let language = null
+        for (const word of words) {
+          const idsReadStream = base.view.createReadStream({
+            gte: `words/${word}`,
+            lte: `words/${word}/\xff`
+          })
+          for await (const { key, value } of idsReadStream) {
+            const ids = JSON.parse(value)
+            if (ids.includes(translation.translationID)) {
+              language = key.slice(key.lastIndexOf('/') + 1)
+              break
+            }
+          }
+          if (language) {
+            break
+          }
+        }
+
+        pipe.write(JSON.stringify({
+          type: 'translation-for-edit',
+          data: {
+            translationID: translation.translationID,
+            translations: translationData.translations,
+            languageID: context.id,
+            languageOfWordForTranslation: language,
+            wordsForTranslation: words
+          }
+        }))
+      }
+    }
+  } catch (error) {
+    sendError(error)
+  }
+}
+
+async function removeTranslationUnlocked(context, translation) {
+  try {
+    const { base } = context
+    await base.append(encodePayload({
+      type: 'link-translation',
+      data: {
+        translationID: translation.translationID,
+        words: [],
+        language: translation.languageOfWordForTranslation
+      }
+    }))
+    await base.append(encodePayload({
+      type: 'remove-translation',
+      data: {
+        translationID: translation.translationID
+      }
+    }))
+  } catch (error) {
+    sendError(error)
+  }
 }
 
 async function handleSearch(search) {
