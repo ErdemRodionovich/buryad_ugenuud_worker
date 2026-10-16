@@ -187,9 +187,47 @@ function languageApply(batch, view, host) {
         }
       } else if (op.type === 'save-translation-api-details') {
         await view.put('language/translation_api_details', JSON.stringify(op.data))
+      } else if (op.type === 'save-translation') {
+        await view.put(`translations/${op.data.translationID}`, JSON.stringify(op.data))
+      } else if (op.type === 'link-translation') {
+        await linkTranslation(view, op.data)
       }
     }
   })()
+}
+
+async function linkTranslation(view, translation) {
+  for (const word of translation.words) {
+    const translationIDs = [translation.translationID]
+    const entry = await view.get(`words/${word}/${translation.language}`)
+    if (entry) {
+      const oldIDs = JSON.parse(entry.value)
+      for (const id of oldIDs) {
+        if (id !== translation.translationID && !translationIDs.includes(id)) {
+          translationIDs.push(id)
+        }
+      }
+    }
+
+    await view.put(`words/${word}/${translation.language}`, JSON.stringify(translationIDs))
+  }
+
+  const entry = await view.get(`translations-to-words/${translation.translationID}`)
+  if (entry) {
+    const oldWords = JSON.parse(entry.value)
+    for (const old of oldWords) {
+      if (!translation.words.includes(old)) {
+        const entryOfOld = view.get(`words/${old}/${translation.language}`)
+        if (entryOfOld) {
+          const ids = JSON.parse(entryOfOld.value)
+          const without = ids.filter((i) => i !== translation.translationID)
+          await view.put(`words/${old}/${translation.language}`, JSON.stringify(without))
+        }
+      }
+    }
+  }
+
+  await view.put(`translations-to-words/${translation.translationID}`, JSON.stringify(translation.words))
 }
 
 function languageOpen(store) {
@@ -470,6 +508,10 @@ pipe.on('data', async (data) => {
       await handlePoll(msg.data)
     } else if (msg.type === 'comment') {
       await handleComment(msg.data)
+    } else if (msg.type === 'translation') {
+      await handleTranslation(msg.data)
+    } else if (msg.type === 'search') {
+      await handleSearch(msg.data)
     }
   } catch (err) {
     console.log(err.message)
@@ -676,6 +718,107 @@ async function getPollResultsUnlocked(context, pollId) {
     results[vote.optionIndex] = (results[vote.optionIndex] || 0) + 1
   }
   return results
+}
+
+async function handleTranslation(translation) {
+  const context = languages.get(translation.languageId)
+  if (!context) return sendError(new Error('Select or join a language first'))
+  return enqueueLanguage(context, () => handleTranslationUnlocked(context, translation))
+}
+
+async function handleTranslationUnlocked(context, translation) {
+  if (translation.cmd === 'save') {
+    return await saveTranslationUnlocked(context, translation)
+  }
+}
+
+async function saveTranslationUnlocked(context, translation) {
+  console.log('saveTranslationUnlocked')
+  const translations = translation.translations.map(({ translation, description, media }) => {
+    return { translation, description, media: normalizeMediaList(media) };
+  });
+
+  if (translation.translationID == '' || !translation.translationID) {
+    translation.translationID = guid();
+  }
+
+  try {
+    const { base } = context
+    await base.ready()
+    const author = keyId(base.local.key)
+
+    await base.append(encodePayload({
+      type: 'save-translation',
+      data: {
+        translationID: translation.translationID,
+        translations,
+        author
+      }
+    }))
+
+    await base.append(encodePayload({
+      type: 'link-translation',
+      data: {
+        translationID: translation.translationID,
+        words: translation.wordsForTranslation,
+        language: translation.languageOfWordForTranslation
+      }
+    }))
+
+    console.log('saved translation: ', JSON.stringify(translation))
+  } catch (error) {
+    sendError(error)
+  }
+}
+
+function guid() {
+  const bytes = crypto.randomBytes(16)
+  bytes[6] = (bytes[6] & 0x0f) | 0x40
+  bytes[8] = (bytes[8] & 0x3f) | 0x80
+
+  const hex = Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('')
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
+}
+
+async function handleSearch(search) {
+  const context = languages.get(search.activeLanguageId)
+  return enqueueLanguage(context, () => handleSearchUnlocked(context, search))
+}
+
+async function handleSearchUnlocked(context, search) {
+  try {
+    const wordsStream = context.base.view.createReadStream({
+      gte: `words/${search.word}`,
+      lte: `words/${search.word}/\xff`
+    })
+
+    const results = []
+    for await (const { key, value } of wordsStream) {
+      const ids = JSON.parse(value)
+      const language = key.slice(key.lastIndexOf('/') + 1)
+      for (const id of ids) {
+        const entry = await context.base.view.get(`translations/${id}`)
+        if (entry) {
+          const translation = JSON.parse(entry.value)
+          for (const trans of translation.translations) {
+            results.push({
+              translationID: translation.translationID,
+              translation: trans.translation,
+              description: trans.description,
+              media: trans.media,
+              language
+            })
+          }
+        }
+      }
+    }
+
+    pipe.write(JSON.stringify({ type: 'found-translations', languageId: context.id, data: results }))
+
+    console.log('sent ', results.length, ' translations: ', JSON.stringify(results))
+  } catch (error) {
+    sendError(error)
+  }
 }
 
 console.log('worker: after all')
