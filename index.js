@@ -107,11 +107,16 @@ const languages = new Map()
 let activeLanguageId = null
 const languageDirectory = path.join(updaterConfig.dir, 'app-storage', 'languages')
 const registryStore = new Corestore(path.join(updaterConfig.dir, 'app-storage', 'registry'))
-const registryView = new Hyperbee(registryStore.get({ name: 'languages' }), {
+const localStateView = new Hyperbee(registryStore.get({ name: 'local-state' }), {
   keyEncoding: 'utf-8',
   valueEncoding: 'json'
 })
-const profileKey = 'profile/self'
+const userStore = new Corestore(path.join(updaterConfig.dir, 'app-storage', 'user'))
+let userBase = null
+let userBaseReady = null
+let userOperationQueue = Promise.resolve()
+let userSyncQueue = Promise.resolve()
+const profileKey = 'user/profile'
 const maxAvatarBytes = 2 * 1024 * 1024
 const supportedAvatarTypes = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif'])
 
@@ -132,40 +137,69 @@ pear.updater.on('updating', () => pipe.write('updating'))
 pear.updater.on('updated', () => pipe.write('updated'))
 pear.on('minver-required', () => pipe.write('minver-required')) // for mobile store update notification
 
-async function readLanguageRegistry() {
-  await registryStore.ready()
-  await registryView.ready()
+function userOpen(store) {
+  return new Hyperbee(store.get({ name: 'view' }), {
+    keyEncoding: 'utf-8',
+    valueEncoding: 'utf-8'
+  })
+}
+
+async function userApply(batch, view, host) {
+  for (const node of batch) {
+    const op = decodePayload(node.value)
+    if (!op) continue
+    const author = keyId(node.from.key)
+    const initialized = await view.get('user/initialized')
+
+    if (op.type === 'user-init' && !initialized) {
+      await view.put('user/initialized', 'true')
+      await view.put('user/owner', author)
+      await view.put(`devices/${author}`, JSON.stringify({ active: true, owner: true }))
+      await view.put(profileKey, JSON.stringify({ nickname: '', avatar: null }))
+      await host.ackWriter(node.from.key)
+      continue
+    }
+
+    const device = await view.get(`devices/${author}`)
+    if (!device || JSON.parse(device.value).active !== true) continue
+    await host.ackWriter(node.from.key)
+
+    if (op.type === 'user-profile') {
+      await view.put(profileKey, JSON.stringify(op.profile))
+    } else if (op.type === 'user-language-add' && op.language?.key) {
+      await view.put(`languages/${op.language.key}`, JSON.stringify(op.language))
+    } else if (op.type === 'user-language-remove' && op.key) {
+      await view.del(`languages/${op.key}`)
+    }
+  }
+}
+
+function enqueueUser(operation) {
+  const previous = userOperationQueue
+  let release
+  userOperationQueue = new Promise((resolve) => {
+    release = resolve
+  })
+  return previous.then(operation).finally(release)
+}
+
+async function readUserLanguages() {
   const entries = []
-  for await (const { value } of registryView.createReadStream({
+  for await (const { value } of userBase.view.createReadStream({
     gte: 'languages/',
     lte: 'languages/\xff'
   })) {
-    entries.push(value)
+    entries.push(JSON.parse(value))
   }
   return entries
 }
 
-async function writeLanguageRegistry() {
-  await registryStore.ready()
-  await registryView.ready()
-  for (const language of languages.values()) {
-    const op = { key: language.key }
-    if (language.storageFolder && language.storageFolder !== language.key)
-      op.storageFolder = language.storageFolder
-    await registryView.put(`languages/${language.key}`, op)
-    console.log('wrote language, key: ', language.key, ' storageFolder:', language.storageFolder)
-  }
-}
-
-async function getProfile() {
-  await registryStore.ready()
-  await registryView.ready()
-  const entry = await registryView.get(profileKey)
-  return entry ? entry.value : { nickname: '', avatar: null }
-}
-
 async function sendProfile() {
-  pipe.write(JSON.stringify({ type: 'profile', data: await getProfile() }))
+  if (userBaseReady) await userBaseReady
+  if (!userBase) throw new Error('User Autobase is not ready')
+  const entry = await userBase.view.get(profileKey)
+  const profile = entry ? JSON.parse(entry.value) : { nickname: '', avatar: null }
+  pipe.write(JSON.stringify({ type: 'profile', data: profile }))
 }
 
 async function saveProfile(data) {
@@ -193,11 +227,78 @@ async function saveProfile(data) {
     avatar = { data: encoded, mime }
   }
 
-  const profile = { nickname, avatar }
+  if (userBaseReady) await userBaseReady
+  if (!userBase) throw new Error('User Autobase is not ready')
+  return enqueueUser(async () => {
+    await userBase.append(encodePayload({ type: 'user-profile', profile: { nickname, avatar } }), {
+      optimistic: true
+    })
+    await userBase.update()
+    await sendProfile()
+  })
+}
+
+async function addLanguageToUserRegistry(language) {
+  const metadata = { key: language.key }
+  if (language.storageFolder && language.storageFolder !== language.key) {
+    metadata.storageFolder = language.storageFolder
+  }
+  await enqueueUser(async () => {
+    await userBase.append(encodePayload({ type: 'user-language-add', language: metadata }), {
+      optimistic: true
+    })
+    await userBase.update()
+  })
+}
+
+async function initializeUserBase() {
   await registryStore.ready()
-  await registryView.ready()
-  await registryView.put(profileKey, profile)
-  pipe.write(JSON.stringify({ type: 'profile', data: profile }))
+  await localStateView.ready()
+  await userStore.ready()
+  const keyEntry = await localStateView.get('user/base')
+  const bootstrap = keyEntry?.value
+  if (bootstrap && !/^[0-9a-f]{64}$/i.test(bootstrap)) {
+    throw new Error('Stored user Autobase key is invalid')
+  }
+
+  userBase = new Autobase(userStore, bootstrap ? b4a.from(bootstrap, 'hex') : null, {
+    optimistic: true,
+    apply: userApply,
+    open: userOpen,
+    ...(!bootstrap ? { keyPair: crypto.keyPair() } : {})
+  })
+  await userBase.ready()
+  if (!bootstrap) await localStateView.put('user/base', keyId(userBase.key))
+
+  if (!(await userBase.view.get('user/initialized'))) {
+    await userBase.append(encodePayload({ type: 'user-init' }), { optimistic: true })
+    await userBase.update()
+  }
+
+  for (const connection of connections) userBase.replicate(connection)
+  swarm.join(userBase.discoveryKey, { client: true, server: true })
+  userBase.on('update', () => {
+    syncUserLanguages().then(sendProfile).catch(sendError)
+  })
+}
+
+function syncUserLanguages() {
+  const next = userSyncQueue.then(syncUserLanguagesUnlocked)
+  userSyncQueue = next.catch(sendError)
+  return userSyncQueue
+}
+
+async function syncUserLanguagesUnlocked() {
+  for (const metadata of await readUserLanguages()) {
+    if (!/^[0-9a-f]{64}$/i.test(metadata.key || '')) {
+      console.log('skipping language: ', JSON.stringify(metadata))
+      continue
+    }
+    if ([...languages.values()].some((language) => language.key === metadata.key)) continue
+    const context = await openLanguage(metadata, b4a.from(metadata.key, 'hex'))
+    if (!activeLanguageId) activeLanguageId = context.id
+  }
+  sendLanguages()
 }
 
 function handleProfile(operation) {
@@ -363,15 +464,9 @@ async function refreshLanguageMetadata(context) {
 }
 
 async function loadLanguages() {
-  for (const metadata of await readLanguageRegistry()) {
-    if (!/^[0-9a-f]{64}$/i.test(metadata.key || '')) {
-      console.log('skipping language: ', JSON.stringify(metadata))
-      continue
-    }
-    const context = await openLanguage(metadata, b4a.from(metadata.key, 'hex'))
-    if (!activeLanguageId) activeLanguageId = context.id
-  }
-  sendLanguages()
+  userBaseReady = initializeUserBase()
+  await userBaseReady
+  await syncUserLanguages()
   if (activeLanguageId) await sendAllPolls(languages.get(activeLanguageId))
 }
 
@@ -412,7 +507,7 @@ async function createLanguage(data) {
   context.description = description
   languages.set(context.id, context)
   activeLanguageId = context.id
-  await writeLanguageRegistry()
+  await addLanguageToUserRegistry(context)
   sendLanguages()
   pipe.write(
     JSON.stringify({ type: 'language-created', data: { id: context.id, key: context.key } })
@@ -435,7 +530,7 @@ async function joinLanguage(data) {
   )
   languages.set(context.id, context)
   activeLanguageId = context.id
-  await writeLanguageRegistry()
+  await addLanguageToUserRegistry(context)
   sendLanguages()
   await sendAllPolls(context)
 }
@@ -527,6 +622,10 @@ swarm.on('connection', (connection) => {
     console.log('Application peer disconnected')
     sendPeerCount()
   })
+  if (userBase) {
+    userBase.replicate(connection)
+    userBase.update().catch(sendError)
+  }
   for (const context of languages.values()) {
     context.base.replicate(connection)
     enqueueLanguage(context, () => context.base.update()).catch(sendError)
@@ -546,7 +645,8 @@ goodbye(async () => {
   await updater_swarm.destroy()
   await swarm.destroy()
   await pear.close()
-  await registryView.close()
+  if (userBase) await userBase.close()
+  await localStateView.close()
   await updater_store.close()
   await registryStore.close()
   for (const context of languages.values()) await context.store.close()
