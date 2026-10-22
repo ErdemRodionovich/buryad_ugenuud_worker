@@ -111,12 +111,16 @@ const localStateView = new Hyperbee(registryStore.get({ name: 'local-state' }), 
   keyEncoding: 'utf-8',
   valueEncoding: 'json'
 })
-const userStore = new Corestore(path.join(updaterConfig.dir, 'app-storage', 'user'))
+const userStoragePath = path.join(updaterConfig.dir, 'app-storage', 'user')
+let userStore = new Corestore(userStoragePath)
 let userBase = null
 let userBaseReady = null
 let userOperationQueue = Promise.resolve()
 let userSyncQueue = Promise.resolve()
 const profileKey = 'user/profile'
+const pairingCodeVersion = 1
+const pairingCodeApp = 'buryad-ugenuud'
+const pairingCodeTtl = 24 * 60 * 60 * 1000
 const maxAvatarBytes = 2 * 1024 * 1024
 const supportedAvatarTypes = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif'])
 
@@ -152,9 +156,13 @@ async function userApply(batch, view, host) {
     const initialized = await view.get('user/initialized')
 
     if (op.type === 'user-init' && !initialized) {
+      if (!/^[0-9a-f]{64}$/i.test(op.signerKey || '')) continue
       await view.put('user/initialized', 'true')
       await view.put('user/owner', author)
-      await view.put(`devices/${author}`, JSON.stringify({ active: true, owner: true }))
+      await view.put(
+        `devices/${author}`,
+        JSON.stringify({ active: true, owner: true, signerKey: op.signerKey })
+      )
       await view.put(profileKey, JSON.stringify({ nickname: '', avatar: null }))
       await host.ackWriter(node.from.key)
       continue
@@ -170,8 +178,127 @@ async function userApply(batch, view, host) {
       await view.put(`languages/${op.language.key}`, JSON.stringify(op.language))
     } else if (op.type === 'user-language-remove' && op.key) {
       await view.del(`languages/${op.key}`)
+    } else if (op.type === 'user-device-add') {
+      const request = op.request
+      if (
+        !isValidPairingRequest(request) ||
+        !verifyPairingRequest(request) ||
+        !Number.isSafeInteger(op.approvedAt)
+      ) {
+        continue
+      }
+      if (request.deviceKey === author || (await view.get(`devices/${request.deviceKey}`))) continue
+      await host.addWriter(b4a.from(request.deviceKey, 'hex'), {
+        indexer: false,
+        isIndexer: false
+      })
+      await view.put(
+        `devices/${request.deviceKey}`,
+        JSON.stringify({
+          active: true,
+          owner: false,
+          signerKey: request.signerKey,
+          pairedAt: op.approvedAt,
+          requestId: request.requestId
+        })
+      )
     }
   }
+}
+
+function pairingRequestPayload(request) {
+  return {
+    app: request.app,
+    version: request.version,
+    type: request.type,
+    deviceKey: request.deviceKey,
+    signerKey: request.signerKey,
+    requestId: request.requestId,
+    createdAt: request.createdAt,
+    expiresAt: request.expiresAt
+  }
+}
+
+function pairingApprovalPayload(approval) {
+  return {
+    app: approval.app,
+    version: approval.version,
+    type: approval.type,
+    userKey: approval.userKey,
+    deviceKey: approval.deviceKey,
+    requestId: approval.requestId,
+    approvedBy: approval.approvedBy,
+    signerKey: approval.signerKey,
+    issuedAt: approval.issuedAt,
+    expiresAt: approval.expiresAt
+  }
+}
+
+function isValidPairingRequest(request) {
+  return Boolean(
+    request &&
+    request.app === pairingCodeApp &&
+    request.version === pairingCodeVersion &&
+    request.type === 'request' &&
+    /^[0-9a-f]{64}$/i.test(request.deviceKey || '') &&
+    /^[0-9a-f]{64}$/i.test(request.signerKey || '') &&
+    /^[0-9a-f]{32}$/i.test(request.requestId || '') &&
+    Number.isSafeInteger(request.createdAt) &&
+    request.expiresAt === request.createdAt + pairingCodeTtl &&
+    /^[0-9a-f]{128}$/i.test(request.signature || '')
+  )
+}
+
+function verifyPairingRequest(request) {
+  return crypto.verify(
+    encodePayload(pairingRequestPayload(request)),
+    b4a.from(request.signature, 'hex'),
+    b4a.from(request.signerKey, 'hex')
+  )
+}
+
+function isValidPairingApproval(approval) {
+  return Boolean(
+    approval &&
+    approval.app === pairingCodeApp &&
+    approval.version === pairingCodeVersion &&
+    approval.type === 'approval' &&
+    /^[0-9a-f]{64}$/i.test(approval.userKey || '') &&
+    /^[0-9a-f]{64}$/i.test(approval.deviceKey || '') &&
+    /^[0-9a-f]{32}$/i.test(approval.requestId || '') &&
+    /^[0-9a-f]{64}$/i.test(approval.approvedBy || '') &&
+    /^[0-9a-f]{64}$/i.test(approval.signerKey || '') &&
+    Number.isSafeInteger(approval.issuedAt) &&
+    approval.expiresAt === approval.issuedAt + pairingCodeTtl &&
+    /^[0-9a-f]{128}$/i.test(approval.signature || '')
+  )
+}
+
+function verifyPairingApproval(approval) {
+  return crypto.verify(
+    encodePayload(pairingApprovalPayload(approval)),
+    b4a.from(approval.signature, 'hex'),
+    b4a.from(approval.signerKey, 'hex')
+  )
+}
+
+function parsePairingCode(raw, type) {
+  if (typeof raw !== 'string' || raw.length > 4096) throw new Error('Pairing code is invalid')
+  let code
+  try {
+    code = JSON.parse(raw)
+  } catch {
+    throw new Error('Pairing code must be copied as JSON text')
+  }
+  const valid = type === 'request' ? isValidPairingRequest(code) : isValidPairingApproval(code)
+  if (!valid) throw new Error(`Pairing ${type} code is invalid`)
+  if (type === 'request' && !verifyPairingRequest(code)) {
+    throw new Error('Pairing request signature is invalid')
+  }
+  if (type === 'approval' && !verifyPairingApproval(code)) {
+    throw new Error('Pairing approval signature is invalid')
+  }
+  return code
 }
 
 function enqueueUser(operation) {
@@ -197,6 +324,8 @@ async function readUserLanguages() {
 async function sendProfile() {
   if (userBaseReady) await userBaseReady
   if (!userBase) throw new Error('User Autobase is not ready')
+  const device = await userBase.view.get(`devices/${keyId(userBase.local.key)}`)
+  if (!device || JSON.parse(device.value).active !== true) return
   const entry = await userBase.view.get(profileKey)
   const profile = entry ? JSON.parse(entry.value) : { nickname: '', avatar: null }
   pipe.write(JSON.stringify({ type: 'profile', data: profile }))
@@ -238,7 +367,186 @@ async function saveProfile(data) {
   })
 }
 
+async function sendPairingStatus() {
+  if (userBaseReady) await userBaseReady
+  if (!userBase) return
+  const deviceKey = keyId(userBase.local.key)
+  const entry = await userBase.view.get(`devices/${deviceKey}`)
+  const device = entry ? JSON.parse(entry.value) : null
+  const pendingApproval = await localStateView.get('pairing/pending-approval')
+  const devices = []
+  for await (const { key, value } of userBase.view.createReadStream({
+    gte: 'devices/',
+    lte: 'devices/\xff'
+  })) {
+    devices.push({
+      key: key.slice('devices/'.length),
+      ...JSON.parse(value)
+    })
+  }
+  pipe.write(
+    JSON.stringify({
+      type: 'pairing-status',
+      data: {
+        userKey: keyId(userBase.key),
+        deviceKey,
+        paired: device?.active === true,
+        pending: Boolean(pendingApproval),
+        devices
+      }
+    })
+  )
+}
+
+async function createPairingRequest() {
+  if (userBaseReady) await userBaseReady
+  if (!userBase) throw new Error('User Autobase is not ready')
+  const deviceKeyPair = await userStore.createKeyPair('user-device')
+  const createdAt = Date.now()
+  const request = {
+    app: pairingCodeApp,
+    version: pairingCodeVersion,
+    type: 'request',
+    deviceKey: keyId(userBase.local.key),
+    signerKey: keyId(deviceKeyPair.publicKey),
+    requestId: crypto.randomBytes(16).toString('hex'),
+    createdAt,
+    expiresAt: createdAt + pairingCodeTtl
+  }
+  request.signature = b4a.toString(
+    crypto.sign(encodePayload(pairingRequestPayload(request)), deviceKeyPair.secretKey),
+    'hex'
+  )
+  await localStateView.put('pairing/request', request)
+  pipe.write(JSON.stringify({ type: 'pairing-request', data: JSON.stringify(request) }))
+}
+
+async function approvePairingRequest(data) {
+  if (userBaseReady) await userBaseReady
+  if (!userBase) throw new Error('User Autobase is not ready')
+  const request = parsePairingCode(data.code, 'request')
+  const now = Date.now()
+  if (request.createdAt > now || request.expiresAt <= now) {
+    throw new Error('Pairing request has expired or has an invalid date')
+  }
+  const currentDevice = await userBase.view.get(`devices/${keyId(userBase.local.key)}`)
+  if (!currentDevice || JSON.parse(currentDevice.value).active !== true) {
+    throw new Error('Only a paired device can approve a pairing request')
+  }
+  if (request.deviceKey === keyId(userBase.local.key)) {
+    throw new Error('This device is already paired')
+  }
+  if (await userBase.view.get(`devices/${request.deviceKey}`)) {
+    throw new Error('This device is already paired')
+  }
+
+  const approvedAt = Date.now()
+  await enqueueUser(async () => {
+    if (request.expiresAt <= Date.now()) throw new Error('Pairing request expired before approval')
+    await userBase.append(encodePayload({ type: 'user-device-add', request, approvedAt }), {
+      optimistic: true
+    })
+    await userBase.update()
+  })
+
+  const deviceKeyPair = await userStore.createKeyPair('user-device')
+  const approval = {
+    app: pairingCodeApp,
+    version: pairingCodeVersion,
+    type: 'approval',
+    userKey: keyId(userBase.key),
+    deviceKey: request.deviceKey,
+    requestId: request.requestId,
+    approvedBy: keyId(userBase.local.key),
+    signerKey: keyId(deviceKeyPair.publicKey),
+    issuedAt: approvedAt,
+    expiresAt: approvedAt + pairingCodeTtl
+  }
+  approval.signature = b4a.toString(
+    crypto.sign(encodePayload(pairingApprovalPayload(approval)), deviceKeyPair.secretKey),
+    'hex'
+  )
+  pipe.write(JSON.stringify({ type: 'pairing-approval', data: JSON.stringify(approval) }))
+  await sendPairingStatus()
+}
+
+async function completePairing(data) {
+  if (userBaseReady) await userBaseReady
+  const approval = parsePairingCode(data.code, 'approval')
+  const now = Date.now()
+  if (approval.issuedAt > now || approval.expiresAt <= now) {
+    throw new Error('Pairing approval has expired or has an invalid date')
+  }
+  const requestEntry = await localStateView.get('pairing/request')
+  const request = requestEntry?.value
+  if (
+    !request ||
+    approval.issuedAt < request.createdAt ||
+    approval.issuedAt > request.expiresAt ||
+    request.deviceKey !== approval.deviceKey ||
+    request.requestId !== approval.requestId
+  ) {
+    throw new Error("Pairing approval does not match this device's active request")
+  }
+  if (keyId(userBase.key) === approval.userKey) {
+    throw new Error('This device is already using that user profile')
+  }
+
+  await localStateView.put('pairing/pending-approval', approval)
+  await swarm.leave(userBase.discoveryKey)
+  await localStateView.put('user/base', approval.userKey)
+  await userBase.close()
+  userBase = null
+  userStore = new Corestore(userStoragePath)
+  userBaseReady = initializeUserBase()
+  await userBaseReady
+  await refreshUserState()
+}
+
+async function refreshUserState() {
+  if (!userBase) return
+  const deviceKey = keyId(userBase.local.key)
+  const deviceEntry = await userBase.view.get(`devices/${deviceKey}`)
+  const device = deviceEntry ? JSON.parse(deviceEntry.value) : null
+  if (device?.active !== true) {
+    await sendPairingStatus()
+    return
+  }
+
+  const pendingEntry = await localStateView.get('pairing/pending-approval')
+  if (pendingEntry) {
+    const approval = pendingEntry.value
+    const approver = await userBase.view.get(`devices/${approval.approvedBy}`)
+    if (
+      approval.deviceKey !== deviceKey ||
+      !approver ||
+      JSON.parse(approver.value).active !== true ||
+      JSON.parse(approver.value).signerKey !== approval.signerKey ||
+      !verifyPairingApproval(approval)
+    ) {
+      await sendPairingStatus()
+      return
+    }
+    await localStateView.del('pairing/pending-approval')
+    await localStateView.del('pairing/request')
+  }
+
+  await syncUserLanguages()
+  await sendProfile()
+  await sendPairingStatus()
+}
+
+function handlePairing(operation) {
+  if (operation.cmd === 'status') return sendPairingStatus()
+  if (operation.cmd === 'create-request') return createPairingRequest()
+  if (operation.cmd === 'approve') return approvePairingRequest(operation)
+  if (operation.cmd === 'complete') return completePairing(operation)
+  throw new Error('Unknown pairing command')
+}
+
 async function addLanguageToUserRegistry(language) {
+  if (userBaseReady) await userBaseReady
+  if (!userBase) throw new Error('User Autobase is not ready')
   const metadata = { key: language.key }
   if (language.storageFolder && language.storageFolder !== language.key) {
     metadata.storageFolder = language.storageFolder
@@ -261,24 +569,28 @@ async function initializeUserBase() {
     throw new Error('Stored user Autobase key is invalid')
   }
 
+  const deviceKeyPair = await userStore.createKeyPair('user-device')
   userBase = new Autobase(userStore, bootstrap ? b4a.from(bootstrap, 'hex') : null, {
     optimistic: true,
     apply: userApply,
     open: userOpen,
-    ...(!bootstrap ? { keyPair: crypto.keyPair() } : {})
+    keyPair: deviceKeyPair
   })
   await userBase.ready()
   if (!bootstrap) await localStateView.put('user/base', keyId(userBase.key))
 
-  if (!(await userBase.view.get('user/initialized'))) {
-    await userBase.append(encodePayload({ type: 'user-init' }), { optimistic: true })
+  if (!bootstrap && !(await userBase.view.get('user/initialized'))) {
+    await userBase.append(
+      encodePayload({ type: 'user-init', signerKey: keyId(deviceKeyPair.publicKey) }),
+      { optimistic: true }
+    )
     await userBase.update()
   }
 
   for (const connection of connections) userBase.replicate(connection)
   swarm.join(userBase.discoveryKey, { client: true, server: true })
   userBase.on('update', () => {
-    syncUserLanguages().then(sendProfile).catch(sendError)
+    refreshUserState().catch(sendError)
   })
 }
 
@@ -289,6 +601,8 @@ function syncUserLanguages() {
 }
 
 async function syncUserLanguagesUnlocked() {
+  const ownDevice = await userBase.view.get(`devices/${keyId(userBase.local.key)}`)
+  if (!ownDevice || JSON.parse(ownDevice.value).active !== true) return
   for (const metadata of await readUserLanguages()) {
     if (!/^[0-9a-f]{64}$/i.test(metadata.key || '')) {
       console.log('skipping language: ', JSON.stringify(metadata))
@@ -466,7 +780,7 @@ async function refreshLanguageMetadata(context) {
 async function loadLanguages() {
   userBaseReady = initializeUserBase()
   await userBaseReady
-  await syncUserLanguages()
+  await refreshUserState()
   if (activeLanguageId) await sendAllPolls(languages.get(activeLanguageId))
 }
 
@@ -667,6 +981,8 @@ pipe.on('data', async (data) => {
       pipe.write(JSON.stringify({ type: 'pong', time: new Date().toISOString() }))
     } else if (msg.type === 'profile') {
       await handleProfile(msg.data)
+    } else if (msg.type === 'pairing') {
+      await handlePairing(msg.data)
     } else if (msg.type === 'language') {
       await handleLanguage(msg.data)
     } else if (msg.type === 'poll') {
