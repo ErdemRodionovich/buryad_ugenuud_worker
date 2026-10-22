@@ -111,6 +111,9 @@ const registryView = new Hyperbee(registryStore.get({ name: 'languages' }), {
   keyEncoding: 'utf-8',
   valueEncoding: 'json'
 })
+const profileKey = 'profile/self'
+const maxAvatarBytes = 2 * 1024 * 1024
+const supportedAvatarTypes = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif'])
 
 console.log('worker: after consts')
 
@@ -152,6 +155,55 @@ async function writeLanguageRegistry() {
     await registryView.put(`languages/${language.key}`, op)
     console.log('wrote language, key: ', language.key, ' storageFolder:', language.storageFolder)
   }
+}
+
+async function getProfile() {
+  await registryStore.ready()
+  await registryView.ready()
+  const entry = await registryView.get(profileKey)
+  return entry ? entry.value : { nickname: '', avatar: null }
+}
+
+async function sendProfile() {
+  pipe.write(JSON.stringify({ type: 'profile', data: await getProfile() }))
+}
+
+async function saveProfile(data) {
+  const nickname = String(data.nickname || '').trim()
+  if (!nickname) throw new Error('Nickname is required')
+  if (nickname.length > 40) throw new Error('Nickname must be 40 characters or fewer')
+
+  let avatar = null
+  if (data.avatar) {
+    const { data: encoded, mime } = data.avatar
+    if (!supportedAvatarTypes.has(mime)) {
+      throw new Error('Avatar must be a PNG, JPEG, WebP, or GIF image')
+    }
+    if (
+      typeof encoded !== 'string' ||
+      encoded.length === 0 ||
+      encoded.length > Math.ceil((maxAvatarBytes * 4) / 3) + 4 ||
+      encoded.length % 4 !== 0 ||
+      !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded)
+    ) {
+      throw new Error('Avatar image data is invalid')
+    }
+    const bytes = b4a.from(encoded, 'base64')
+    if (bytes.byteLength > maxAvatarBytes) throw new Error('Avatar must be 2 MB or smaller')
+    avatar = { data: encoded, mime }
+  }
+
+  const profile = { nickname, avatar }
+  await registryStore.ready()
+  await registryView.ready()
+  await registryView.put(profileKey, profile)
+  pipe.write(JSON.stringify({ type: 'profile', data: profile }))
+}
+
+function handleProfile(operation) {
+  if (operation.cmd === 'get') return sendProfile()
+  if (operation.cmd === 'save') return saveProfile(operation)
+  throw new Error('Unknown profile command')
 }
 
 function languageApply(batch, view, host) {
@@ -331,6 +383,7 @@ function sendLanguages() {
       data: [...languages.values()].map(({ base, store, ...metadata }) => {
         const { id, key, storageFolder, name, description, creator } = metadata
         const isOwner = (creator === keyId(base.local.key))
+        console.log('sent language ', name, ' isOwner: ', isOwner)
         return {
           id,
           key,
@@ -512,6 +565,8 @@ pipe.on('data', async (data) => {
     const msg = JSON.parse(message)
     if (msg.type === 'ping') {
       pipe.write(JSON.stringify({ type: 'pong', time: new Date().toISOString() }))
+    } else if (msg.type === 'profile') {
+      await handleProfile(msg.data)
     } else if (msg.type === 'language') {
       await handleLanguage(msg.data)
     } else if (msg.type === 'poll') {
@@ -527,6 +582,7 @@ pipe.on('data', async (data) => {
     console.log(err.message)
     console.log('while handling:')
     console.log(message)
+    sendError(err)
   }
 })
 
