@@ -106,6 +106,7 @@ const connections = new Set()
 const languages = new Map()
 let activeLanguageId = null
 const languageDirectory = path.join(updaterConfig.dir, 'app-storage', 'languages')
+const userBaseDirectory = path.join(updaterConfig.dir, 'app-storage', 'user-bases')
 const registryStore = new Corestore(path.join(updaterConfig.dir, 'app-storage', 'registry'))
 const localStateView = new Hyperbee(registryStore.get({ name: 'local-state' }), {
   keyEncoding: 'utf-8',
@@ -113,6 +114,7 @@ const localStateView = new Hyperbee(registryStore.get({ name: 'local-state' }), 
 })
 const userStoragePath = path.join(updaterConfig.dir, 'app-storage', 'user')
 let userStore = new Corestore(userStoragePath)
+let userBaseStore = userStore
 let userBase = null
 let userBaseReady = null
 let userOperationQueue = Promise.resolve()
@@ -174,7 +176,10 @@ async function userApply(batch, view, host) {
 
     if (op.type === 'user-profile') {
       await view.put(profileKey, JSON.stringify(op.profile))
-    } else if (op.type === 'user-language-add' && op.language?.key) {
+    } else if (
+      op.type === 'user-language-add' &&
+      /^[0-9a-f]{64}$/i.test(op.language?.key || '')
+    ) {
       await view.put(`languages/${op.language.key}`, JSON.stringify(op.language))
     } else if (op.type === 'user-language-remove' && op.key) {
       await view.del(`languages/${op.key}`)
@@ -494,10 +499,15 @@ async function completePairing(data) {
 
   await localStateView.put('pairing/pending-approval', approval)
   await swarm.leave(userBase.discoveryKey)
+  await localStateView.put('user/base-storage', approval.userKey)
   await localStateView.put('user/base', approval.userKey)
   await userBase.close()
+  if (userBaseStore === userStore) {
+    userStore = new Corestore(userStoragePath)
+    await userStore.ready()
+  }
   userBase = null
-  userStore = new Corestore(userStoragePath)
+  userBaseStore = userStore
   userBaseReady = initializeUserBase()
   await userBaseReady
   await refreshUserState()
@@ -551,8 +561,15 @@ async function addLanguageToUserRegistry(language) {
   if (language.storageFolder && language.storageFolder !== language.key) {
     metadata.storageFolder = language.storageFolder
   }
+  for (const field of ['name', 'description', 'creator']) {
+    if (typeof language[field] === 'string') metadata[field] = language[field]
+  }
   await enqueueUser(async () => {
-    await userBase.append(encodePayload({ type: 'user-language-add', language: metadata }), {
+    const entry = await userBase.view.get(`languages/${metadata.key}`)
+    const current = entry ? JSON.parse(entry.value) : {}
+    const next = { ...current, ...metadata }
+    if (JSON.stringify(current) === JSON.stringify(next)) return
+    await userBase.append(encodePayload({ type: 'user-language-add', language: next }), {
       optimistic: true
     })
     await userBase.update()
@@ -568,15 +585,28 @@ async function initializeUserBase() {
   if (bootstrap && !/^[0-9a-f]{64}$/i.test(bootstrap)) {
     throw new Error('Stored user Autobase key is invalid')
   }
+  const storageEntry = await localStateView.get('user/base-storage')
+  if (storageEntry && storageEntry.value !== bootstrap) {
+    throw new Error('Stored user Autobase storage key does not match its base key')
+  }
+  const pairedStorage = Boolean(storageEntry)
+  if (userBaseStore !== userStore) await userBaseStore.close()
+  userBaseStore = bootstrap && pairedStorage
+    ? new Corestore(path.join(userBaseDirectory, bootstrap))
+    : userStore
+  await userBaseStore.ready()
 
   const deviceKeyPair = await userStore.createKeyPair('user-device')
-  userBase = new Autobase(userStore, bootstrap ? b4a.from(bootstrap, 'hex') : null, {
-    optimistic: true,
-    apply: userApply,
-    open: userOpen,
-    keyPair: deviceKeyPair
-  })
+  const openBase = (store) =>
+    new Autobase(store, bootstrap ? b4a.from(bootstrap, 'hex') : null, {
+      optimistic: true,
+      apply: userApply,
+      open: userOpen,
+      keyPair: deviceKeyPair
+    })
+  userBase = openBase(userBaseStore)
   await userBase.ready()
+
   if (!bootstrap) await localStateView.put('user/base', keyId(userBase.key))
 
   if (!bootstrap && !(await userBase.view.get('user/initialized'))) {
@@ -608,7 +638,13 @@ async function syncUserLanguagesUnlocked() {
       console.log('skipping language: ', JSON.stringify(metadata))
       continue
     }
-    if ([...languages.values()].some((language) => language.key === metadata.key)) continue
+    const existing = [...languages.values()].find((language) => language.key === metadata.key)
+    if (existing) {
+      for (const field of ['name', 'description', 'creator']) {
+        if (typeof metadata[field] === 'string') existing[field] = metadata[field]
+      }
+      continue
+    }
     const context = await openLanguage(metadata, b4a.from(metadata.key, 'hex'))
     if (!activeLanguageId) activeLanguageId = context.id
   }
@@ -733,7 +769,10 @@ async function openLanguage(metadata, bootstrap, keyPair = null) {
     key: languageKey,
     base,
     store: languageStore,
-    operationQueue: Promise.resolve()
+    operationQueue: Promise.resolve(),
+    name: metadata.name,
+    description: metadata.description,
+    creator: metadata.creator
   }
   await base.ready()
 
@@ -741,7 +780,10 @@ async function openLanguage(metadata, bootstrap, keyPair = null) {
   context.id = context.key
   context.storageFolder = storageFolder
   const metaEntry = await metaOfLanguage(context)
-  if (metaEntry) Object.assign(context, metaEntry)
+  if (metaEntry) {
+    Object.assign(context, metaEntry)
+    await addLanguageToUserRegistry(context)
+  }
   languages.set(context.id, context)
 
   for (const connection of connections) context.base.replicate(connection)
@@ -753,12 +795,10 @@ async function openLanguage(metadata, bootstrap, keyPair = null) {
     await base.local.setUserData('language/joined', b4a.from('1'))
   }
   base.on('update', () => {
-    if (activeLanguageId === context.id) {
-      enqueueLanguage(context, async () => {
-        await refreshLanguageMetadata(context)
-        await sendAllPollsUnlocked(context)
-      }).catch(sendError)
-    }
+    enqueueLanguage(context, async () => {
+      await refreshLanguageMetadata(context)
+      if (activeLanguageId === context.id) await sendAllPollsUnlocked(context)
+    }).catch(sendError)
   })
   return context
 }
@@ -770,9 +810,10 @@ async function metaOfLanguage(context) {
 }
 
 async function refreshLanguageMetadata(context) {
-  const meta = metaOfLanguage(context)
+  const meta = await metaOfLanguage(context)
   if (meta) {
     Object.assign(context, meta)
+    await addLanguageToUserRegistry(context)
   }
   sendLanguages()
 }
@@ -960,6 +1001,7 @@ goodbye(async () => {
   await swarm.destroy()
   await pear.close()
   if (userBase) await userBase.close()
+  if (userBaseStore !== userStore) await userStore.close()
   await localStateView.close()
   await updater_store.close()
   await registryStore.close()
