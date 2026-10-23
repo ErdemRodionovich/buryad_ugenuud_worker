@@ -968,7 +968,13 @@ function languageApply(batch, view, host) {
           JSON.stringify({ ...op.data, id: op.id, creator: author, closed: false })
         )
       } else if (op.type === 'cast-vote') {
-        await view.put(`votes/${op.pollId}/${author}`, JSON.stringify(op.data))
+        const voter = /^[0-9a-f]{64}$/i.test(op.voter || '')
+          ? op.voter.toLowerCase()
+          : author
+        const voteKey = `votes/${op.pollId}/${voter}`
+        if (!(await view.get(voteKey))) {
+          await view.put(voteKey, JSON.stringify(op.data))
+        }
       } else if (op.type === 'close-poll') {
         const entry = await view.get(`polls/${op.pollId}`)
         if (entry && JSON.parse(entry.value).creator === author) {
@@ -1436,14 +1442,21 @@ async function handlePollUnlocked(pollOperation, context) {
       ) {
         throw new Error('Choose a valid option')
       }
-      if (await getVoteUnlocked(context, poll.id, author)) {
+      if (userBaseReady) await userBaseReady
+      if (!userBase) throw new Error('User profile is not ready')
+      const device = await userBase.view.get(`devices/${keyId(userBase.local.key)}`)
+      if (!device || JSON.parse(device.value).active !== true) {
+        throw new Error('This device is not paired to an active user')
+      }
+      const voter = keyId(userBase.key)
+      if (await getVoteUnlocked(context, poll.id, voter)) {
         throw new Error('You have already voted in this poll')
       }
       await base.append(
         encodePayload({
           type: 'cast-vote',
           pollId: poll.id,
-          author,
+          voter,
           data: { optionIndex: pollOperation.optionIndex, createdAt: Date.now() }
         }),
         { optimistic: true }
@@ -1476,6 +1489,8 @@ async function sendAllPolls(context) {
 async function sendAllPollsUnlocked(context) {
   await context.base.ready()
   await context.base.update()
+  if (userBaseReady) await userBaseReady
+  const voter = userBase ? keyId(userBase.key) : null
 
   const pollsStream = context.base.view.createReadStream({
     gte: 'polls/',
@@ -1487,6 +1502,7 @@ async function sendAllPollsUnlocked(context) {
     if (key.includes('/closed')) continue
     const poll = JSON.parse(value)
     poll.votes = await getPollResultsUnlocked(context, poll.id)
+    poll.hasVoted = voter ? await getVoteUnlocked(context, poll.id, voter) : false
     results[poll.id] = poll
   }
 
@@ -1504,6 +1520,8 @@ async function getPollUnlocked(context, pollId) {
   const poll = JSON.parse(entry.value)
   poll.closed = (await context.base.view.get(`polls/${pollId}/closed`)) !== null
   poll.votes = await getPollResultsUnlocked(context, pollId)
+  if (userBaseReady) await userBaseReady
+  poll.hasVoted = userBase ? await getVoteUnlocked(context, pollId, keyId(userBase.key)) : false
   return poll
 }
 
