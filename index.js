@@ -103,6 +103,7 @@ const swarm = new Hyperswarm()
 const pear = new PearRuntime({ ...updaterConfig, swarm: updater_swarm, store: updater_store })
 const peers = new Set()
 const connections = new Set()
+const pairingSessions = new Map()
 const languages = new Map()
 let activeLanguageId = null
 const languageDirectory = path.join(updaterConfig.dir, 'app-storage', 'languages')
@@ -218,6 +219,7 @@ function pairingRequestPayload(request) {
     type: request.type,
     deviceKey: request.deviceKey,
     signerKey: request.signerKey,
+    pairingSecretHash: request.pairingSecretHash,
     requestId: request.requestId,
     createdAt: request.createdAt,
     expiresAt: request.expiresAt
@@ -247,6 +249,10 @@ function isValidPairingRequest(request) {
     request.type === 'request' &&
     /^[0-9a-f]{64}$/i.test(request.deviceKey || '') &&
     /^[0-9a-f]{64}$/i.test(request.signerKey || '') &&
+    /^[0-9a-f]{64}$/i.test(request.pairingSecretHash || '') &&
+    (request.pairingSecret === undefined ||
+      (/^[0-9a-f]{64}$/i.test(request.pairingSecret) &&
+        keyId(crypto.hash(b4a.from(request.pairingSecret, 'hex'))) === request.pairingSecretHash)) &&
     /^[0-9a-f]{32}$/i.test(request.requestId || '') &&
     Number.isSafeInteger(request.createdAt) &&
     request.expiresAt === request.createdAt + pairingCodeTtl &&
@@ -414,16 +420,19 @@ async function createPairingRequest() {
     type: 'request',
     deviceKey: keyId(userBase.local.key),
     signerKey: keyId(deviceKeyPair.publicKey),
+    pairingSecret: crypto.randomBytes(32).toString('hex'),
     requestId: crypto.randomBytes(16).toString('hex'),
     createdAt,
     expiresAt: createdAt + pairingCodeTtl
   }
+  request.pairingSecretHash = keyId(crypto.hash(b4a.from(request.pairingSecret, 'hex')))
   request.signature = b4a.toString(
     crypto.sign(encodePayload(pairingRequestPayload(request)), deviceKeyPair.secretKey),
     'hex'
   )
   await localStateView.put('pairing/request', request)
   pipe.write(JSON.stringify({ type: 'pairing-request', data: JSON.stringify(request) }))
+  await startPairingSession('requester', request)
 }
 
 async function approvePairingRequest(data) {
@@ -446,9 +455,11 @@ async function approvePairingRequest(data) {
   }
 
   const approvedAt = Date.now()
+  const approvedRequest = { ...request }
+  delete approvedRequest.pairingSecret
   await enqueueUser(async () => {
     if (request.expiresAt <= Date.now()) throw new Error('Pairing request expired before approval')
-    await userBase.append(encodePayload({ type: 'user-device-add', request, approvedAt }), {
+    await userBase.append(encodePayload({ type: 'user-device-add', request: approvedRequest, approvedAt }), {
       optimistic: true
     })
     await userBase.update()
@@ -471,8 +482,283 @@ async function approvePairingRequest(data) {
     crypto.sign(encodePayload(pairingApprovalPayload(approval)), deviceKeyPair.secretKey),
     'hex'
   )
+  await localStateView.put(`pairing/approved/${request.requestId}`, { request, approval })
   pipe.write(JSON.stringify({ type: 'pairing-approval', data: JSON.stringify(approval) }))
+  await startPairingSession('approver', request, approval)
   await sendPairingStatus()
+}
+
+function sendPairingConnectionStatus(requestId, status, role) {
+  pipe.write(
+    JSON.stringify({
+      type: 'pairing-connection-status',
+      data: { requestId, status, role }
+    })
+  )
+}
+
+function pairingTopic(request) {
+  return crypto.hash(b4a.from(request.pairingSecret, 'hex'))
+}
+
+function pairingChallengePayload(requestId, challenge) {
+  return {
+    app: pairingCodeApp,
+    type: 'pairing-challenge-response',
+    requestId,
+    challenge
+  }
+}
+
+function writePairingMessage(session, message) {
+  return new Promise((resolve, reject) => {
+    session.stream.write(JSON.stringify(message), (error) => {
+      if (error) reject(error)
+      else resolve()
+    })
+  })
+}
+
+async function stopPairingSession(session, status = null) {
+  if (pairingSessions.get(session.request.requestId) !== session) return
+  pairingSessions.delete(session.request.requestId)
+  clearTimeout(session.expirationTimer)
+  if (status === 'expired') {
+    if (session.role === 'requester') {
+      await localStateView.del('pairing/request')
+    } else {
+      await localStateView.del(`pairing/approved/${session.request.requestId}`)
+    }
+  }
+  if (status) sendPairingConnectionStatus(session.request.requestId, status, session.role)
+  if (session.stream && !session.stream.destroyed) session.stream.destroy()
+  await session.swarm.leave(session.topic)
+  await session.swarm.destroy()
+}
+
+async function startPairingSession(role, request, approval = null) {
+  const existing = pairingSessions.get(request.requestId)
+  if (existing) await stopPairingSession(existing)
+  const expiresAt = Math.min(request.expiresAt, approval?.expiresAt || request.expiresAt)
+  const remaining = expiresAt - Date.now()
+  if (remaining <= 0) {
+    sendPairingConnectionStatus(request.requestId, 'expired', role)
+    return
+  }
+
+  const swarm = new Hyperswarm()
+  const session = {
+    role,
+    request,
+    approval,
+    swarm,
+    topic: pairingTopic(request),
+    stream: null,
+    challenge: null,
+    completed: false,
+    expirationTimer: null
+  }
+  pairingSessions.set(request.requestId, session)
+  session.expirationTimer = setTimeout(() => {
+    stopPairingSession(session, 'expired').catch(sendError)
+  }, remaining)
+  swarm.on('error', (error) => {
+    sendPairingConnectionStatus(request.requestId, 'error', role)
+    sendError(error)
+  })
+  swarm.on('connection', (socket) => {
+    if (pairingSessions.get(request.requestId) !== session || session.completed) {
+      socket.destroy()
+      return
+    }
+    if (session.stream) {
+      socket.destroy()
+      return
+    }
+    session.stream = new FramedStream(socket, { bits: 16 })
+    session.stream.on('error', (error) => {
+      if (!session.completed) {
+        session.stream = null
+        sendPairingConnectionStatus(request.requestId, 'waiting', role)
+        sendError(error)
+      }
+    })
+    session.stream.on('close', () => {
+      session.stream = null
+      session.challenge = null
+      if (!session.completed && pairingSessions.get(request.requestId) === session) {
+        sendPairingConnectionStatus(request.requestId, 'waiting', role)
+      }
+    })
+    session.stream.on('data', (data) => {
+      handlePairingTransportMessage(session, data).catch((error) => {
+        sendPairingConnectionStatus(request.requestId, 'error', role)
+        sendError(error)
+        if (session.stream && !session.stream.destroyed) session.stream.destroy()
+      })
+    })
+    sendPairingConnectionStatus(request.requestId, 'connected', role)
+    if (role === 'requester') {
+      writePairingMessage(session, {
+        type: 'request',
+        data: { ...pairingRequestPayload(request), pairingSecret: request.pairingSecret },
+        signature: request.signature
+      }).catch(sendError)
+    }
+  })
+
+  swarm.join(session.topic, { client: true, server: true })
+  sendPairingConnectionStatus(request.requestId, 'waiting', role)
+}
+
+async function handlePairingTransportMessage(session, bytes) {
+  if (bytes.byteLength > 8192) throw new Error('Pairing message is too large')
+  let message
+  try {
+    message = JSON.parse(b4a.toString(bytes, 'utf-8'))
+  } catch {
+    throw new Error('Pairing peer sent invalid data')
+  }
+
+  if (session.role === 'approver' && message?.type === 'request') {
+    const request = { ...message.data, type: 'request', signature: message.signature }
+    if (
+      !isValidPairingRequest(request) ||
+      !verifyPairingRequest(request) ||
+      request.requestId !== session.request.requestId ||
+      request.deviceKey !== session.request.deviceKey ||
+      request.signerKey !== session.request.signerKey ||
+      request.pairingSecret !== session.request.pairingSecret ||
+      request.pairingSecretHash !== session.request.pairingSecretHash ||
+      request.signature !== session.request.signature
+    ) {
+      throw new Error('Direct pairing request did not match the approved request')
+    }
+    if (session.request.expiresAt <= Date.now()) throw new Error('Pairing request has expired')
+    if (session.challenge) throw new Error('Pairing request challenge is already active')
+    session.challenge = crypto.randomBytes(32).toString('hex')
+    await writePairingMessage(session, {
+      type: 'challenge',
+      requestId: session.request.requestId,
+      challenge: session.challenge
+    })
+    return
+  }
+
+  if (
+    session.role === 'approver' &&
+    message?.type === 'proof' &&
+    message.requestId === session.request.requestId &&
+    message.challenge === session.challenge &&
+    message.signerKey === session.request.signerKey &&
+    /^[0-9a-f]{128}$/i.test(message.signature || '') &&
+    crypto.verify(
+      encodePayload(pairingChallengePayload(message.requestId, message.challenge)),
+      b4a.from(message.signature, 'hex'),
+      b4a.from(message.signerKey, 'hex')
+    )
+  ) {
+    if (session.request.expiresAt <= Date.now()) throw new Error('Pairing request has expired')
+    session.challenge = null
+    await writePairingMessage(session, { type: 'approval', approval: session.approval })
+    sendPairingConnectionStatus(session.request.requestId, 'approval-sent', session.role)
+    return
+  }
+
+  if (
+    session.role === 'approver' &&
+    message?.type === 'complete' &&
+    message.requestId === session.request.requestId
+  ) {
+    session.completed = true
+    await localStateView.del(`pairing/approved/${session.request.requestId}`)
+    return stopPairingSession(session, 'complete')
+  }
+
+  if (
+    session.role === 'requester' &&
+    message?.type === 'challenge' &&
+    message.requestId === session.request.requestId &&
+    /^[0-9a-f]{64}$/i.test(message.challenge || '')
+  ) {
+    const deviceKeyPair = await userStore.createKeyPair('user-device')
+    if (keyId(deviceKeyPair.publicKey) !== session.request.signerKey) {
+      throw new Error('This device signing key no longer matches the pairing request')
+    }
+    const signature = b4a.toString(
+      crypto.sign(
+        encodePayload(pairingChallengePayload(message.requestId, message.challenge)),
+        deviceKeyPair.secretKey
+      ),
+      'hex'
+    )
+    await writePairingMessage(session, {
+      type: 'proof',
+      requestId: message.requestId,
+      challenge: message.challenge,
+      signerKey: keyId(deviceKeyPair.publicKey),
+      signature
+    })
+    return
+  }
+
+  if (session.role === 'requester' && message?.type === 'approval') {
+    const approval = message.approval
+    if (
+      !isValidPairingApproval(approval) ||
+      !verifyPairingApproval(approval) ||
+      approval.deviceKey !== session.request.deviceKey ||
+      approval.requestId !== session.request.requestId ||
+      approval.issuedAt < session.request.createdAt ||
+      approval.issuedAt > session.request.expiresAt ||
+      approval.expiresAt <= Date.now()
+    ) {
+      throw new Error('Direct pairing approval is invalid or does not match this request')
+    }
+    sendPairingConnectionStatus(session.request.requestId, 'approval-received', session.role)
+    await completePairing({ code: JSON.stringify(approval) })
+    if (session.stream && !session.stream.destroyed) {
+      await writePairingMessage(session, { type: 'complete', requestId: session.request.requestId })
+    }
+    return stopPairingSession(session, 'complete')
+  }
+
+  throw new Error('Unexpected message from pairing peer')
+}
+
+async function resumePairingSessions() {
+  const requestEntry = await localStateView.get('pairing/request')
+  const request = requestEntry?.value
+  if (
+    request &&
+    isValidPairingRequest(request) &&
+    verifyPairingRequest(request) &&
+    request.expiresAt > Date.now()
+  ) {
+    pipe.write(JSON.stringify({ type: 'pairing-request', data: JSON.stringify(request) }))
+    await startPairingSession('requester', request)
+  } else if (request) {
+    await localStateView.del('pairing/request')
+  }
+
+  for await (const { key, value } of localStateView.createReadStream({
+    gte: 'pairing/approved/',
+    lte: 'pairing/approved/\xff'
+  })) {
+    const { request: approvedRequest, approval } = value
+    if (
+      isValidPairingRequest(approvedRequest) &&
+      verifyPairingRequest(approvedRequest) &&
+      isValidPairingApproval(approval) &&
+      verifyPairingApproval(approval) &&
+      approval.expiresAt > Date.now()
+    ) {
+      pipe.write(JSON.stringify({ type: 'pairing-approval', data: JSON.stringify(approval) }))
+      await startPairingSession('approver', approvedRequest, approval)
+    } else {
+      await localStateView.del(key)
+    }
+  }
 }
 
 async function completePairing(data) {
@@ -989,6 +1275,7 @@ swarm.on('connection', (connection) => {
 
 async function startReplication() {
   await loadLanguages()
+  await resumePairingSessions()
   sendPeerCount()
 }
 
@@ -997,6 +1284,7 @@ function sendPeerCount() {
 }
 
 goodbye(async () => {
+  for (const session of pairingSessions.values()) await stopPairingSession(session)
   await updater_swarm.destroy()
   await swarm.destroy()
   await pear.close()
