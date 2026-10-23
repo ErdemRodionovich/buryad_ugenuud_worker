@@ -40,6 +40,38 @@ function keyId(key) {
   return b4a.toString(key, 'hex')
 }
 
+function isValidAccountSigningKeyPair(keyPair) {
+  if (
+    !keyPair ||
+    !/^[0-9a-f]{64}$/i.test(keyPair.publicKey || '') ||
+    !/^[0-9a-f]{128}$/i.test(keyPair.secretKey || '')
+  ) {
+    return false
+  }
+  const challenge = encodePayload({ type: 'account-signing-key-check' })
+  return crypto.verify(
+    challenge,
+    crypto.sign(challenge, b4a.from(keyPair.secretKey, 'hex')),
+    b4a.from(keyPair.publicKey, 'hex')
+  )
+}
+
+function pollCreationPayload(poll) {
+  return {
+    type: 'create-poll',
+    pollId: poll.id,
+    creator: poll.creator,
+    question: poll.question,
+    questionMedia: poll.questionMedia,
+    options: poll.options,
+    createdAt: poll.createdAt
+  }
+}
+
+function pollClosePayload(pollId, creator) {
+  return { type: 'close-poll', pollId, creator }
+}
+
 function enqueueLanguage(context, operation) {
   const previous = context.operationQueue
   let release
@@ -175,7 +207,14 @@ async function userApply(batch, view, host) {
     if (!device || JSON.parse(device.value).active !== true) continue
     await host.ackWriter(node.from.key)
 
-    if (op.type === 'user-profile') {
+    if (op.type === 'user-account-signing-key') {
+      if (
+        !(await view.get('user/account-signing-key')) &&
+        isValidAccountSigningKeyPair(op.keyPair)
+      ) {
+        await view.put('user/account-signing-key', JSON.stringify(op.keyPair))
+      }
+    } else if (op.type === 'user-profile') {
       await view.put(profileKey, JSON.stringify(op.profile))
     } else if (
       op.type === 'user-language-add' &&
@@ -319,6 +358,51 @@ function enqueueUser(operation) {
     release = resolve
   })
   return previous.then(operation).finally(release)
+}
+
+async function getAccountSigningKeyPair() {
+  if (userBaseReady) await userBaseReady
+  if (!userBase) throw new Error('User profile is not ready')
+  await userBase.update()
+  const entry = await userBase.view.get('user/account-signing-key')
+  if (!entry) return null
+  const keyPair = JSON.parse(entry.value)
+  if (!isValidAccountSigningKeyPair(keyPair)) {
+    throw new Error('Stored account signing key is invalid')
+  }
+  return keyPair
+}
+
+async function ensureAccountSigningKeyPair() {
+  if (userBaseReady) await userBaseReady
+  if (!userBase) throw new Error('User profile is not ready')
+  const device = await userBase.view.get(`devices/${keyId(userBase.local.key)}`)
+  if (!device || JSON.parse(device.value).active !== true) {
+    throw new Error('This device is not paired to an active user')
+  }
+
+  let keyPair = await getAccountSigningKeyPair()
+  if (keyPair) return keyPair
+
+  await enqueueUser(async () => {
+    keyPair = await getAccountSigningKeyPair()
+    if (keyPair) return
+    const candidate = crypto.keyPair()
+    await userBase.append(
+      encodePayload({
+        type: 'user-account-signing-key',
+        keyPair: {
+          publicKey: keyId(candidate.publicKey),
+          secretKey: keyId(candidate.secretKey)
+        }
+      }),
+      { optimistic: true }
+    )
+    await userBase.update()
+    keyPair = await getAccountSigningKeyPair()
+    if (!keyPair) throw new Error('Account signing key was not saved')
+  })
+  return keyPair
 }
 
 async function readUserLanguages() {
@@ -963,22 +1047,71 @@ function languageApply(batch, view, host) {
           JSON.stringify({ name: op.name, description: op.description, creator: op.creator })
         )
       } else if (op.type === 'create-poll') {
+        const signedPoll = {
+          ...op.data,
+          id: op.id,
+          creator: op.creator
+        }
+        const hasValidCreatorKey = /^[0-9a-f]{64}$/i.test(op.creator || '')
+        const hasValidSignature = /^[0-9a-f]{128}$/i.test(op.creatorSignature || '')
+        const validSignature = hasValidCreatorKey && hasValidSignature &&
+          crypto.verify(
+            encodePayload(pollCreationPayload(signedPoll)),
+            b4a.from(op.creatorSignature, 'hex'),
+            b4a.from(op.creator, 'hex')
+          )
+        if (!validSignature) {
+          console.error(
+            'Rejected poll creation with an invalid account signature:',
+            JSON.stringify({
+              id: op.id,
+              author: author.slice(0, 12),
+              hasValidCreatorKey,
+              hasValidSignature,
+              dataIdMatches: op.data?.id === op.id,
+              dataCreatorMatches: op.data?.creator === op.creator,
+              questionIsString: typeof op.data?.question === 'string',
+              optionsIsArray: Array.isArray(op.data?.options),
+              questionMediaIsArray: Array.isArray(op.data?.questionMedia)
+            })
+          )
+          continue
+        }
         await view.put(
           `polls/${op.id}`,
-          JSON.stringify({ ...op.data, id: op.id, creator: author, closed: false })
+          JSON.stringify({
+            ...signedPoll,
+            creator: op.creator.toLowerCase(),
+            accountCreator: true,
+            closed: false
+          })
         )
       } else if (op.type === 'cast-vote') {
         const voter = /^[0-9a-f]{64}$/i.test(op.voter || '')
           ? op.voter.toLowerCase()
           : author
         const voteKey = `votes/${op.pollId}/${voter}`
-        if (!(await view.get(voteKey))) {
+        const pollEntry = await view.get(`polls/${op.pollId}`)
+        const isClosed = await view.get(`polls/${op.pollId}/closed`)
+        if (pollEntry && !isClosed && !(await view.get(voteKey))) {
           await view.put(voteKey, JSON.stringify(op.data))
         }
       } else if (op.type === 'close-poll') {
         const entry = await view.get(`polls/${op.pollId}`)
-        if (entry && JSON.parse(entry.value).creator === author) {
-          await view.put(`polls/${op.pollId}/closed`, 'true')
+        if (entry) {
+          const poll = JSON.parse(entry.value)
+          const hasAccountAuthorization =
+            poll.accountCreator === true &&
+            op.creator === poll.creator &&
+            /^[0-9a-f]{128}$/i.test(op.signature || '') &&
+            crypto.verify(
+              encodePayload(pollClosePayload(op.pollId, op.creator)),
+              b4a.from(op.signature, 'hex'),
+              b4a.from(poll.creator, 'hex')
+            )
+          if (hasAccountAuthorization) {
+            await view.put(`polls/${op.pollId}/closed`, 'true')
+          }
         }
       } else if (op.type === 'save-translation-api-details') {
         await view.put('language/translation_api_details', JSON.stringify(op.data))
@@ -1414,22 +1547,46 @@ async function handlePollUnlocked(pollOperation, context) {
       }
 
       const id = `${Date.now()}-${author.slice(0, 12)}`
+      const accountKeyPair = await ensureAccountSigningKeyPair()
+      const creator = accountKeyPair.publicKey.toLowerCase()
+      const createdAt = Date.now()
+      const data = {
+        id,
+        question,
+        questionMedia,
+        options,
+        creator,
+        createdAt
+      }
+      const creatorSignature = keyId(
+        crypto.sign(
+          encodePayload(pollCreationPayload(data)),
+          b4a.from(accountKeyPair.secretKey, 'hex')
+        )
+      )
+      if (
+        !crypto.verify(
+          encodePayload(pollCreationPayload(data)),
+          b4a.from(creatorSignature, 'hex'),
+          b4a.from(creator, 'hex')
+        )
+      ) {
+        throw new Error('New poll account signature failed local verification')
+      }
       await base.append(
         encodePayload({
           type: 'create-poll',
           id,
-          data: {
-            id,
-            question,
-            questionMedia,
-            options,
-            creator: author,
-            closed: false,
-            createdAt: Date.now()
-          }
+          creator,
+          creatorSignature,
+          data: { ...data, closed: false }
         }),
         { optimistic: true }
       )
+      await base.update()
+      if (!(await base.view.get(`polls/${id}`))) {
+        throw new Error('Poll creation was rejected by the language database')
+      }
       await sendAllPollsUnlocked(context)
     } else if (pollOperation.cmd === 'vote') {
       const poll = await getPollUnlocked(context, pollOperation.pollId)
@@ -1465,11 +1622,28 @@ async function handlePollUnlocked(pollOperation, context) {
     } else if (pollOperation.cmd === 'close') {
       const poll = await getPollUnlocked(context, pollOperation.pollId)
       if (!poll) throw new Error('Poll not found')
-      if (poll.creator !== author) throw new Error('Only the poll creator can close voting')
+      const accountKeyPair = await ensureAccountSigningKeyPair()
+      const creator = accountKeyPair.publicKey.toLowerCase()
+      if (poll.creator !== creator) {
+        throw new Error('Only the poll creator can close voting')
+      }
+      const closeOperation = {
+        type: 'close-poll',
+        pollId: poll.id,
+        creator,
+        signature: keyId(
+          crypto.sign(
+            encodePayload(pollClosePayload(poll.id, creator)),
+            b4a.from(accountKeyPair.secretKey, 'hex')
+          )
+        )
+      }
       if (!poll.closed) {
-        await base.append(encodePayload({ type: 'close-poll', pollId: poll.id }), {
-          optimistic: true
-        })
+        await base.append(encodePayload(closeOperation), { optimistic: true })
+        await base.update()
+        if ((await base.view.get(`polls/${poll.id}/closed`)) === null) {
+          throw new Error('Poll close was rejected by the language database')
+        }
       }
       await sendAllPollsUnlocked(context)
     } else if (pollOperation.cmd === 'get-all') {
@@ -1491,6 +1665,8 @@ async function sendAllPollsUnlocked(context) {
   await context.base.update()
   if (userBaseReady) await userBaseReady
   const voter = userBase ? keyId(userBase.key) : null
+  const accountKeyPair = await getAccountSigningKeyPair()
+  const accountCreator = accountKeyPair ? accountKeyPair.publicKey.toLowerCase() : null
 
   const pollsStream = context.base.view.createReadStream({
     gte: 'polls/',
@@ -1501,8 +1677,10 @@ async function sendAllPollsUnlocked(context) {
   for await (const { key, value } of pollsStream) {
     if (key.includes('/closed')) continue
     const poll = JSON.parse(value)
+    poll.closed = (await context.base.view.get(`polls/${poll.id}/closed`)) !== null
     poll.votes = await getPollResultsUnlocked(context, poll.id)
     poll.hasVoted = voter ? await getVoteUnlocked(context, poll.id, voter) : false
+    poll.canClose = Boolean(accountCreator && poll.creator === accountCreator)
     results[poll.id] = poll
   }
 
@@ -1522,6 +1700,10 @@ async function getPollUnlocked(context, pollId) {
   poll.votes = await getPollResultsUnlocked(context, pollId)
   if (userBaseReady) await userBaseReady
   poll.hasVoted = userBase ? await getVoteUnlocked(context, pollId, keyId(userBase.key)) : false
+  const accountKeyPair = await getAccountSigningKeyPair()
+  poll.canClose = Boolean(
+    accountKeyPair && poll.creator === accountKeyPair.publicKey.toLowerCase()
+  )
   return poll
 }
 
