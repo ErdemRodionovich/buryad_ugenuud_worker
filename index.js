@@ -72,6 +72,55 @@ function pollClosePayload(pollId, creator) {
   return { type: 'close-poll', pollId, creator }
 }
 
+const languageRoles = new Set([
+  'administrator',
+  'vote-closer',
+  'word-creator',
+  'banned-create-vote',
+  'banned-comment'
+])
+
+function languageRoleKey(accountKey, role) {
+  return `roles/${accountKey}/${role}`
+}
+
+function languageRolePayload(operation) {
+  return {
+    type: 'set-language-role',
+    actor: operation.actor,
+    target: operation.target,
+    role: operation.role,
+    enabled: operation.enabled
+  }
+}
+
+function languageMetaPayload(metadata) {
+  return {
+    type: 'language-meta',
+    name: metadata.name,
+    description: metadata.description,
+    creator: metadata.creator,
+    ownerAccountKey: metadata.ownerAccountKey
+  }
+}
+
+function verifyAccountSignature(payload, actor, signature) {
+  return (
+    /^[0-9a-f]{64}$/i.test(actor || '') &&
+    /^[0-9a-f]{128}$/i.test(signature || '') &&
+    crypto.verify(encodePayload(payload), b4a.from(signature, 'hex'), b4a.from(actor, 'hex'))
+  )
+}
+
+function signedLanguageDataOperation(type, data, keyPair) {
+  const actor = keyId(b4a.from(keyPair.publicKey, 'hex'))
+  const payload = { type, data, actor }
+  return {
+    ...payload,
+    signature: keyId(crypto.sign(encodePayload(payload), b4a.from(keyPair.secretKey, 'hex')))
+  }
+}
+
 function enqueueLanguage(context, operation) {
   const previous = context.operationQueue
   let release
@@ -216,10 +265,7 @@ async function userApply(batch, view, host) {
       }
     } else if (op.type === 'user-profile') {
       await view.put(profileKey, JSON.stringify(op.profile))
-    } else if (
-      op.type === 'user-language-add' &&
-      /^[0-9a-f]{64}$/i.test(op.language?.key || '')
-    ) {
+    } else if (op.type === 'user-language-add' && /^[0-9a-f]{64}$/i.test(op.language?.key || '')) {
       await view.put(`languages/${op.language.key}`, JSON.stringify(op.language))
     } else if (op.type === 'user-language-remove' && op.key) {
       await view.del(`languages/${op.key}`)
@@ -291,7 +337,8 @@ function isValidPairingRequest(request) {
     /^[0-9a-f]{64}$/i.test(request.pairingSecretHash || '') &&
     (request.pairingSecret === undefined ||
       (/^[0-9a-f]{64}$/i.test(request.pairingSecret) &&
-        keyId(crypto.hash(b4a.from(request.pairingSecret, 'hex'))) === request.pairingSecretHash)) &&
+        keyId(crypto.hash(b4a.from(request.pairingSecret, 'hex'))) ===
+          request.pairingSecretHash)) &&
     /^[0-9a-f]{32}$/i.test(request.requestId || '') &&
     Number.isSafeInteger(request.createdAt) &&
     request.expiresAt === request.createdAt + pairingCodeTtl &&
@@ -543,9 +590,12 @@ async function approvePairingRequest(data) {
   delete approvedRequest.pairingSecret
   await enqueueUser(async () => {
     if (request.expiresAt <= Date.now()) throw new Error('Pairing request expired before approval')
-    await userBase.append(encodePayload({ type: 'user-device-add', request: approvedRequest, approvedAt }), {
-      optimistic: true
-    })
+    await userBase.append(
+      encodePayload({ type: 'user-device-add', request: approvedRequest, approvedAt }),
+      {
+        optimistic: true
+      }
+    )
     await userBase.update()
   })
 
@@ -961,9 +1011,8 @@ async function initializeUserBase() {
   }
   const pairedStorage = Boolean(storageEntry)
   if (userBaseStore !== userStore) await userBaseStore.close()
-  userBaseStore = bootstrap && pairedStorage
-    ? new Corestore(path.join(userBaseDirectory, bootstrap))
-    : userStore
+  userBaseStore =
+    bootstrap && pairedStorage ? new Corestore(path.join(userBaseDirectory, bootstrap)) : userStore
   await userBaseStore.ready()
 
   const deviceKeyPair = await userStore.createKeyPair('user-device')
@@ -1042,10 +1091,42 @@ function languageApply(batch, view, host) {
       }
 
       if (op.type === 'language-meta') {
-        await view.put(
-          'language/meta',
-          JSON.stringify({ name: op.name, description: op.description, creator: op.creator })
-        )
+        if (await view.get('language/meta')) continue
+        const metadata = {
+          name: op.name,
+          description: op.description,
+          creator: op.creator,
+          ownerAccountKey: op.ownerAccountKey
+        }
+        if (
+          op.creator !== author ||
+          !verifyAccountSignature(languageMetaPayload(metadata), op.ownerAccountKey, op.signature)
+        ) {
+          continue
+        }
+        await view.put('language/meta', JSON.stringify(metadata))
+      } else if (op.type === 'set-language-role') {
+        if (
+          !/^[0-9a-f]{64}$/i.test(op.target || '') ||
+          !languageRoles.has(op.role) ||
+          typeof op.enabled !== 'boolean' ||
+          !verifyAccountSignature(languageRolePayload(op), op.actor, op.signature)
+        ) {
+          continue
+        }
+        const metaEntry = await view.get('language/meta')
+        const meta = metaEntry ? JSON.parse(metaEntry.value) : null
+        const actorIsAdmin =
+          (await view.get(languageRoleKey(op.actor, 'administrator'))) !== null ||
+          meta?.ownerAccountKey === op.actor ||
+          (!meta?.ownerAccountKey && meta?.creator === author)
+        if (!actorIsAdmin) continue
+        if (meta?.ownerAccountKey === op.target && op.role === 'administrator' && !op.enabled) {
+          continue
+        }
+        const key = languageRoleKey(op.target.toLowerCase(), op.role)
+        if (op.enabled) await view.put(key, 'true')
+        else await view.del(key)
       } else if (op.type === 'create-poll') {
         const signedPoll = {
           ...op.data,
@@ -1054,7 +1135,9 @@ function languageApply(batch, view, host) {
         }
         const hasValidCreatorKey = /^[0-9a-f]{64}$/i.test(op.creator || '')
         const hasValidSignature = /^[0-9a-f]{128}$/i.test(op.creatorSignature || '')
-        const validSignature = hasValidCreatorKey && hasValidSignature &&
+        const validSignature =
+          hasValidCreatorKey &&
+          hasValidSignature &&
           crypto.verify(
             encodePayload(pollCreationPayload(signedPoll)),
             b4a.from(op.creatorSignature, 'hex'),
@@ -1077,6 +1160,17 @@ function languageApply(batch, view, host) {
           )
           continue
         }
+        const creatorIsBanned =
+          (await view.get(languageRoleKey(op.creator.toLowerCase(), 'banned-create-vote'))) !== null
+        const metaEntry = await view.get('language/meta')
+        const meta = metaEntry ? JSON.parse(metaEntry.value) : null
+        const creatorIsAdmin =
+          (await view.get(languageRoleKey(op.creator.toLowerCase(), 'administrator'))) !== null ||
+          meta?.ownerAccountKey === op.creator ||
+          (!meta?.ownerAccountKey && meta?.creator === author)
+        if (creatorIsBanned && !creatorIsAdmin) {
+          continue
+        }
         await view.put(
           `polls/${op.id}`,
           JSON.stringify({
@@ -1087,9 +1181,7 @@ function languageApply(batch, view, host) {
           })
         )
       } else if (op.type === 'cast-vote') {
-        const voter = /^[0-9a-f]{64}$/i.test(op.voter || '')
-          ? op.voter.toLowerCase()
-          : author
+        const voter = /^[0-9a-f]{64}$/i.test(op.voter || '') ? op.voter.toLowerCase() : author
         const voteKey = `votes/${op.pollId}/${voter}`
         const pollEntry = await view.get(`polls/${op.pollId}`)
         const isClosed = await view.get(`polls/${op.pollId}/closed`)
@@ -1100,30 +1192,75 @@ function languageApply(batch, view, host) {
         const entry = await view.get(`polls/${op.pollId}`)
         if (entry) {
           const poll = JSON.parse(entry.value)
+          const actor = op.actor || op.creator
+          const signedPayload = op.actor
+            ? { type: 'close-poll', pollId: op.pollId, actor }
+            : pollClosePayload(op.pollId, op.creator)
+          const signedByActor = verifyAccountSignature(signedPayload, actor, op.signature)
+          const metaEntry = await view.get('language/meta')
+          const meta = metaEntry ? JSON.parse(metaEntry.value) : null
           const hasAccountAuthorization =
             poll.accountCreator === true &&
-            op.creator === poll.creator &&
-            /^[0-9a-f]{128}$/i.test(op.signature || '') &&
-            crypto.verify(
-              encodePayload(pollClosePayload(op.pollId, op.creator)),
-              b4a.from(op.signature, 'hex'),
-              b4a.from(poll.creator, 'hex')
-            )
+            signedByActor &&
+            (actor === poll.creator ||
+              (await view.get(languageRoleKey(actor, 'administrator'))) !== null ||
+              (await view.get(languageRoleKey(actor, 'vote-closer'))) !== null ||
+              meta?.ownerAccountKey === actor ||
+              (!meta?.ownerAccountKey && meta?.creator === author))
           if (hasAccountAuthorization) {
             await view.put(`polls/${op.pollId}/closed`, 'true')
           }
         }
       } else if (op.type === 'save-translation-api-details') {
-        await view.put('language/translation_api_details', JSON.stringify(op.data))
+        const metaEntry = await view.get('language/meta')
+        const meta = metaEntry ? JSON.parse(metaEntry.value) : null
+        if (
+          verifyAccountSignature(
+            { type: op.type, data: op.data, actor: op.actor },
+            op.actor,
+            op.signature
+          ) &&
+          ((await view.get(languageRoleKey(op.actor, 'administrator'))) !== null ||
+            meta?.ownerAccountKey === op.actor ||
+            (!meta?.ownerAccountKey && meta?.creator === author))
+        ) {
+          await view.put('language/translation_api_details', JSON.stringify(op.data))
+        }
       } else if (op.type === 'save-translation') {
-        await view.put(`translations/${op.data.translationID}`, JSON.stringify(op.data))
+        if (await isAuthorizedWordOperation(view, op, author)) {
+          await view.put(`translations/${op.data.translationID}`, JSON.stringify(op.data))
+        }
       } else if (op.type === 'remove-translation') {
-        await view.del(`translations/${op.data.translationID}`)
+        if (await isAuthorizedWordOperation(view, op, author)) {
+          await view.del(`translations/${op.data.translationID}`)
+        }
       } else if (op.type === 'link-translation') {
-        await linkTranslation(view, op.data)
+        if (await isAuthorizedWordOperation(view, op, author)) {
+          await linkTranslation(view, op.data)
+        }
       }
     }
   })()
+}
+
+async function isAuthorizedWordOperation(view, operation, author) {
+  if (
+    !verifyAccountSignature(
+      { type: operation.type, data: operation.data, actor: operation.actor },
+      operation.actor,
+      operation.signature
+    )
+  ) {
+    return false
+  }
+  const metaEntry = await view.get('language/meta')
+  const meta = metaEntry ? JSON.parse(metaEntry.value) : null
+  return (
+    (await view.get(languageRoleKey(operation.actor, 'administrator'))) !== null ||
+    (await view.get(languageRoleKey(operation.actor, 'word-creator'))) !== null ||
+    meta?.ownerAccountKey === operation.actor ||
+    (!meta?.ownerAccountKey && meta?.creator === author)
+  )
 }
 
 async function linkTranslation(view, translation) {
@@ -1162,7 +1299,10 @@ async function linkTranslation(view, translation) {
   }
 
   if (translation.words.length > 0) {
-    await view.put(`translations-to-words/${translation.translationID}`, JSON.stringify(translation.words))
+    await view.put(
+      `translations-to-words/${translation.translationID}`,
+      JSON.stringify(translation.words)
+    )
   } else {
     await view.del(`translations-to-words/${translation.translationID}`)
   }
@@ -1222,7 +1362,10 @@ async function openLanguage(metadata, bootstrap, keyPair = null) {
   base.on('update', () => {
     enqueueLanguage(context, async () => {
       await refreshLanguageMetadata(context)
-      if (activeLanguageId === context.id) await sendAllPollsUnlocked(context)
+      if (activeLanguageId === context.id) {
+        await sendLanguageRolesUnlocked(context)
+        await sendAllPollsUnlocked(context)
+      }
     }).catch(sendError)
   })
   return context
@@ -1240,7 +1383,7 @@ async function refreshLanguageMetadata(context) {
     Object.assign(context, meta)
     await addLanguageToUserRegistry(context)
   }
-  sendLanguages()
+  sendLanguages().catch(sendError)
 }
 
 async function loadLanguages() {
@@ -1250,36 +1393,97 @@ async function loadLanguages() {
   if (activeLanguageId) await sendAllPolls(languages.get(activeLanguageId))
 }
 
-function sendLanguages() {
+async function hasLanguageRole(context, accountKey, role) {
+  if (!accountKey) return false
+  const meta = await metaOfLanguage(context)
+  if (role === 'administrator') {
+    return Boolean(
+      (await context.base.view.get(languageRoleKey(accountKey, role))) ||
+      meta?.ownerAccountKey === accountKey ||
+      (!meta?.ownerAccountKey && meta?.creator === keyId(context.base.local.key))
+    )
+  }
+  return (await context.base.view.get(languageRoleKey(accountKey, role))) !== null
+}
+
+function sendLanguageRoles(context) {
+  return enqueueLanguage(context, () => sendLanguageRolesUnlocked(context))
+}
+
+async function sendLanguageRolesUnlocked(context) {
+  await context.base.ready()
+  const accountKeyPair = await ensureAccountSigningKeyPair()
+  const accountKey = accountKeyPair?.publicKey.toLowerCase() || null
+  const rolesByUser = new Map()
+  for await (const { key } of context.base.view.createReadStream({
+    gte: 'roles/',
+    lte: 'roles/\xff'
+  })) {
+    const [, userKey, role] = key.split('/')
+    if (!rolesByUser.has(userKey)) rolesByUser.set(userKey, [])
+    rolesByUser.get(userKey).push(role)
+  }
+  const meta = await metaOfLanguage(context)
+  if (meta?.ownerAccountKey) {
+    const ownerRoles = rolesByUser.get(meta.ownerAccountKey) || []
+    if (!ownerRoles.includes('administrator')) ownerRoles.push('administrator')
+    rolesByUser.set(meta.ownerAccountKey, ownerRoles)
+  } else if (meta?.creator === keyId(context.base.local.key) && accountKey) {
+    const legacyOwnerRoles = rolesByUser.get(accountKey) || []
+    if (!legacyOwnerRoles.includes('administrator')) legacyOwnerRoles.push('administrator')
+    rolesByUser.set(accountKey, legacyOwnerRoles)
+  }
   pipe.write(
     JSON.stringify({
-      type: 'languages',
-      active: activeLanguageId,
-      data: [...languages.values()].map(({ base, store, ...metadata }) => {
-        const { id, key, storageFolder, name, description, creator } = metadata
-        const isOwner = (creator === keyId(base.local.key))
-        console.log('sent language ', name, ' isOwner: ', isOwner)
-        return {
-          id,
-          key,
-          storageFolder,
-          name,
-          description,
-          creator,
-          isOwner
-        }
-      })
+      type: 'language-roles',
+      languageId: context.id,
+      accountKey,
+      roles: [...rolesByUser].map(([userKey, userRoles]) => ({ userKey, roles: userRoles }))
     })
   )
+}
+
+async function sendLanguages() {
+  try {
+    const accountKeyPair = await getAccountSigningKeyPair()
+    const accountKey = accountKeyPair?.publicKey.toLowerCase() || null
+    const data = []
+    for (const { base, store, ...metadata } of languages.values()) {
+      const { id, key, storageFolder, name, description, creator } = metadata
+      const isOwner = accountKey
+        ? await hasLanguageRole({ ...metadata, base }, accountKey, 'administrator')
+        : creator === keyId(base.local.key)
+      data.push({ id, key, storageFolder, name, description, creator, isOwner })
+    }
+    pipe.write(JSON.stringify({ type: 'languages', active: activeLanguageId, data }))
+  } catch (error) {
+    sendError(error)
+  }
 }
 
 async function createLanguage(data) {
   const name = String(data.name || '').trim()
   const description = String(data.description || '').trim()
   if (!name) throw new Error('Language name is required')
+  const accountKeyPair = await ensureAccountSigningKeyPair()
   const keyPair = crypto.keyPair()
   const context = await openLanguage({}, null, keyPair)
-  await context.base.append(encodePayload({ type: 'language-meta', name, description, creator: keyId(context.base.local.key) }))
+  const metadata = {
+    name,
+    description,
+    creator: keyId(context.base.local.key),
+    ownerAccountKey: accountKeyPair.publicKey.toLowerCase()
+  }
+  const metaPayload = languageMetaPayload(metadata)
+  await context.base.append(
+    encodePayload({
+      ...metaPayload,
+      signature: keyId(
+        crypto.sign(encodePayload(metaPayload), b4a.from(accountKeyPair.secretKey, 'hex'))
+      )
+    })
+  )
+  Object.assign(context, metadata)
   await context.base.update()
   await context.base.flush()
   await context.base.local.setUserData('language/joined', b4a.from('1'))
@@ -1288,7 +1492,8 @@ async function createLanguage(data) {
   languages.set(context.id, context)
   activeLanguageId = context.id
   await addLanguageToUserRegistry(context)
-  sendLanguages()
+  await sendLanguages()
+  await sendLanguageRoles(context)
   pipe.write(
     JSON.stringify({ type: 'language-created', data: { id: context.id, key: context.key } })
   )
@@ -1311,16 +1516,64 @@ async function joinLanguage(data) {
   languages.set(context.id, context)
   activeLanguageId = context.id
   await addLanguageToUserRegistry(context)
-  sendLanguages()
+  await sendLanguages()
+  await sendLanguageRoles(context)
   await sendAllPolls(context)
 }
 
 function selectLanguage(id) {
   if (!languages.has(id)) throw new Error('Language not found')
   activeLanguageId = id
-  sendLanguages()
+  sendLanguages().catch(sendError)
+  sendLanguageRoles(languages.get(id)).catch(sendError)
   sendTranslationAPI_Details(languages.get(id))
   return sendAllPolls(languages.get(id))
+}
+
+function setLanguageRole(operation) {
+  const context = languages.get(operation.languageId || activeLanguageId)
+  if (!context) throw new Error('Select or join a language first')
+  const target = String(operation.target || '')
+    .trim()
+    .toLowerCase()
+  const role = operation.role
+  if (!/^[0-9a-f]{64}$/.test(target)) {
+    throw new Error('Account key must be 64 hexadecimal characters')
+  }
+  if (!languageRoles.has(role)) throw new Error('Choose a valid language role')
+  if (typeof operation.enabled !== 'boolean') throw new Error('Role enabled state is required')
+  return enqueueLanguage(context, async () => {
+    const accountKeyPair = await ensureAccountSigningKeyPair()
+    const actor = accountKeyPair.publicKey.toLowerCase()
+    if (!(await hasLanguageRole(context, actor, 'administrator'))) {
+      throw new Error('Only a language administrator can assign roles')
+    }
+    const roleData = {
+      type: 'set-language-role',
+      actor,
+      target,
+      role,
+      enabled: operation.enabled
+    }
+    await context.base.append(
+      encodePayload({
+        ...roleData,
+        signature: keyId(
+          crypto.sign(
+            encodePayload(languageRolePayload(roleData)),
+            b4a.from(accountKeyPair.secretKey, 'hex')
+          )
+        )
+      }),
+      { optimistic: true }
+    )
+    await context.base.update()
+    const assigned = (await context.base.view.get(languageRoleKey(target, role))) !== null
+    if (assigned !== operation.enabled) {
+      throw new Error('Role assignment was rejected by the language database')
+    }
+    await sendLanguageRolesUnlocked(context)
+  })
 }
 
 function saveTranslationAPI_Details(details) {
@@ -1334,28 +1587,29 @@ async function saveTranslationAPI_DetailsUnlocked(details, context) {
     const { base } = context
     const { yKey, yFolderID, gKey, gProjectID } = details
     await base.ready()
-    // check for privileges
-    const meta = await metaOfLanguage(context)
-    if (meta && meta.creator === keyId(base.local.key)) {
-      base.append(
-        encodePayload(
-          {
-            type: 'save-translation-api-details',
-            data: {
-              yKey,
-              yFolderID,
-              gKey,
-              gProjectID
-            }
-          }
-        ),
-        { optimistic: true }
-      )
-    } else if (!meta) {
-      console.log('Cannot save Translation API details! NO meta!')
-    } else {
-      console.log('Cannot save Translation API details! not creator')
+    const accountKeyPair = await ensureAccountSigningKeyPair()
+    const actor = accountKeyPair.publicKey.toLowerCase()
+    if (!(await hasLanguageRole(context, actor, 'administrator'))) {
+      throw new Error('Only a language administrator can save translation API details')
     }
+    const operation = {
+      type: 'save-translation-api-details',
+      actor,
+      data: { yKey, yFolderID, gKey, gProjectID }
+    }
+    await base.append(
+      encodePayload({
+        ...operation,
+        signature: keyId(
+          crypto.sign(
+            encodePayload({ type: operation.type, data: operation.data, actor }),
+            b4a.from(accountKeyPair.secretKey, 'hex')
+          )
+        )
+      }),
+      { optimistic: true }
+    )
+    await base.update()
   } catch (error) {
     sendError(error)
   }
@@ -1370,15 +1624,15 @@ async function sendTranslationAPI_DetailsUnlocked(context) {
   const detailsEntry = await context.base.view.get('language/translation_api_details')
   if (detailsEntry) {
     const details = JSON.parse(detailsEntry.value)
-    pipe.write(JSON.stringify(
-      {
+    pipe.write(
+      JSON.stringify({
         type: 'translation-api-details',
         data: {
           ...details,
           languageId: context.id
         }
-      }
-    ))
+      })
+    )
   }
 }
 
@@ -1387,6 +1641,7 @@ function handleLanguage(operation) {
   if (operation.cmd === 'join') return joinLanguage(operation)
   if (operation.cmd === 'select') return selectLanguage(operation.id)
   if (operation.cmd === 'list') return sendLanguages()
+  if (operation.cmd === 'set-role') return setLanguageRole(operation)
   if (operation.cmd === 'saveAPI_Details') return saveTranslationAPI_Details(operation)
   throw new Error('Unknown language command')
 }
@@ -1549,6 +1804,12 @@ async function handlePollUnlocked(pollOperation, context) {
       const id = `${Date.now()}-${author.slice(0, 12)}`
       const accountKeyPair = await ensureAccountSigningKeyPair()
       const creator = accountKeyPair.publicKey.toLowerCase()
+      if (
+        (await base.view.get(languageRoleKey(creator, 'banned-create-vote'))) &&
+        !(await hasLanguageRole(context, creator, 'administrator'))
+      ) {
+        throw new Error('You are not allowed to create polls in this language')
+      }
       const createdAt = Date.now()
       const data = {
         id,
@@ -1623,17 +1884,19 @@ async function handlePollUnlocked(pollOperation, context) {
       const poll = await getPollUnlocked(context, pollOperation.pollId)
       if (!poll) throw new Error('Poll not found')
       const accountKeyPair = await ensureAccountSigningKeyPair()
-      const creator = accountKeyPair.publicKey.toLowerCase()
-      if (poll.creator !== creator) {
-        throw new Error('Only the poll creator can close voting')
-      }
+      const actor = accountKeyPair.publicKey.toLowerCase()
+      const canClose =
+        poll.creator === actor ||
+        (await hasLanguageRole(context, actor, 'administrator')) ||
+        (await hasLanguageRole(context, actor, 'vote-closer'))
+      if (!canClose) throw new Error('You are not allowed to close voting in this language')
       const closeOperation = {
         type: 'close-poll',
         pollId: poll.id,
-        creator,
+        actor,
         signature: keyId(
           crypto.sign(
-            encodePayload(pollClosePayload(poll.id, creator)),
+            encodePayload({ type: 'close-poll', pollId: poll.id, actor }),
             b4a.from(accountKeyPair.secretKey, 'hex')
           )
         )
@@ -1654,7 +1917,21 @@ async function handlePollUnlocked(pollOperation, context) {
   }
 }
 
-function handleComment(commentOperation) { }
+function handleComment(commentOperation) {
+  const context = languages.get(commentOperation.languageId || activeLanguageId)
+  if (!context) throw new Error('Select or join a language first')
+  return enqueueLanguage(context, async () => {
+    const accountKeyPair = await ensureAccountSigningKeyPair()
+    const accountKey = accountKeyPair.publicKey.toLowerCase()
+    if (
+      (await hasLanguageRole(context, accountKey, 'banned-comment')) &&
+      !(await hasLanguageRole(context, accountKey, 'administrator'))
+    ) {
+      throw new Error('You are not allowed to comment in this language')
+    }
+    throw new Error('Comments are not implemented yet')
+  })
+}
 
 async function sendAllPolls(context) {
   return enqueueLanguage(context, () => sendAllPollsUnlocked(context))
@@ -1680,7 +1957,12 @@ async function sendAllPollsUnlocked(context) {
     poll.closed = (await context.base.view.get(`polls/${poll.id}/closed`)) !== null
     poll.votes = await getPollResultsUnlocked(context, poll.id)
     poll.hasVoted = voter ? await getVoteUnlocked(context, poll.id, voter) : false
-    poll.canClose = Boolean(accountCreator && poll.creator === accountCreator)
+    poll.canClose = Boolean(
+      accountCreator &&
+      (poll.creator === accountCreator ||
+        (await hasLanguageRole(context, accountCreator, 'administrator')) ||
+        (await hasLanguageRole(context, accountCreator, 'vote-closer')))
+    )
     results[poll.id] = poll
   }
 
@@ -1701,8 +1983,12 @@ async function getPollUnlocked(context, pollId) {
   if (userBaseReady) await userBaseReady
   poll.hasVoted = userBase ? await getVoteUnlocked(context, pollId, keyId(userBase.key)) : false
   const accountKeyPair = await getAccountSigningKeyPair()
+  const accountKey = accountKeyPair?.publicKey.toLowerCase()
   poll.canClose = Boolean(
-    accountKeyPair && poll.creator === accountKeyPair.publicKey.toLowerCase()
+    accountKey &&
+    (poll.creator === accountKey ||
+      (await hasLanguageRole(context, accountKey, 'administrator')) ||
+      (await hasLanguageRole(context, accountKey, 'vote-closer')))
   )
   return poll
 }
@@ -1749,39 +2035,50 @@ async function handleTranslationUnlocked(context, translation) {
 }
 
 async function saveTranslationUnlocked(context, translation) {
-  console.log('saveTranslationUnlocked')
   const translations = translation.translations.map(({ translation, description, media }) => {
-    return { translation, description, media: normalizeMediaList(media) };
-  });
+    return { translation, description, media: normalizeMediaList(media) }
+  })
 
   if (translation.translationID == '' || !translation.translationID) {
-    translation.translationID = guid();
+    translation.translationID = guid()
   }
 
   try {
     const { base } = context
     await base.ready()
+    const accountKeyPair = await ensureAccountSigningKeyPair()
+    const actor = accountKeyPair.publicKey.toLowerCase()
+    if (
+      !(await hasLanguageRole(context, actor, 'administrator')) &&
+      !(await hasLanguageRole(context, actor, 'word-creator'))
+    ) {
+      throw new Error('Only a language word creator or administrator can save translations')
+    }
     const author = keyId(base.local.key)
 
-    await base.append(encodePayload({
-      type: 'save-translation',
-      data: {
+    const saveOperation = signedLanguageDataOperation(
+      'save-translation',
+      {
         translationID: translation.translationID,
         translations,
         author
-      }
-    }))
+      },
+      accountKeyPair
+    )
+    await base.append(encodePayload(saveOperation), { optimistic: true })
 
-    await base.append(encodePayload({
-      type: 'link-translation',
-      data: {
+    const linkOperation = signedLanguageDataOperation(
+      'link-translation',
+      {
         translationID: translation.translationID,
         words: translation.wordsForTranslation,
         language: translation.languageOfWordForTranslation
-      }
-    }))
+      },
+      accountKeyPair
+    )
+    await base.append(encodePayload(linkOperation), { optimistic: true })
 
-    console.log('saved translation: ', JSON.stringify(translation))
+    await base.update()
   } catch (error) {
     sendError(error)
   }
@@ -1792,7 +2089,7 @@ function guid() {
   bytes[6] = (bytes[6] & 0x0f) | 0x40
   bytes[8] = (bytes[8] & 0x3f) | 0x80
 
-  const hex = Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('')
+  const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
 }
 
@@ -1823,16 +2120,18 @@ async function getTranslationForEditUnlocked(context, translation) {
           }
         }
 
-        pipe.write(JSON.stringify({
-          type: 'translation-for-edit',
-          data: {
-            translationID: translation.translationID,
-            translations: translationData.translations,
-            languageID: context.id,
-            languageOfWordForTranslation: language,
-            wordsForTranslation: words
-          }
-        }))
+        pipe.write(
+          JSON.stringify({
+            type: 'translation-for-edit',
+            data: {
+              translationID: translation.translationID,
+              translations: translationData.translations,
+              languageID: context.id,
+              languageOfWordForTranslation: language,
+              wordsForTranslation: words
+            }
+          })
+        )
       }
     }
   } catch (error) {
@@ -1843,20 +2142,33 @@ async function getTranslationForEditUnlocked(context, translation) {
 async function removeTranslationUnlocked(context, translation) {
   try {
     const { base } = context
-    await base.append(encodePayload({
-      type: 'link-translation',
-      data: {
+    const accountKeyPair = await ensureAccountSigningKeyPair()
+    const actor = accountKeyPair.publicKey.toLowerCase()
+    if (
+      !(await hasLanguageRole(context, actor, 'administrator')) &&
+      !(await hasLanguageRole(context, actor, 'word-creator'))
+    ) {
+      throw new Error('Only a language word creator or administrator can remove translations')
+    }
+    const linkOperation = signedLanguageDataOperation(
+      'link-translation',
+      {
         translationID: translation.translationID,
         words: [],
         language: translation.languageOfWordForTranslation
-      }
-    }))
-    await base.append(encodePayload({
-      type: 'remove-translation',
-      data: {
+      },
+      accountKeyPair
+    )
+    await base.append(encodePayload(linkOperation), { optimistic: true })
+    const removeOperation = signedLanguageDataOperation(
+      'remove-translation',
+      {
         translationID: translation.translationID
-      }
-    }))
+      },
+      accountKeyPair
+    )
+    await base.append(encodePayload(removeOperation), { optimistic: true })
+    await base.update()
   } catch (error) {
     sendError(error)
   }
@@ -1895,7 +2207,9 @@ async function handleSearchUnlocked(context, search) {
       }
     }
 
-    pipe.write(JSON.stringify({ type: 'found-translations', languageId: context.id, data: results }))
+    pipe.write(
+      JSON.stringify({ type: 'found-translations', languageId: context.id, data: results })
+    )
 
     console.log('sent ', results.length, ' translations: ', JSON.stringify(results))
   } catch (error) {
