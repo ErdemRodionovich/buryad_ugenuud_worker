@@ -104,6 +104,16 @@ function languageMetaPayload(metadata) {
   }
 }
 
+function languageMemberPayload(member) {
+  return {
+    type: 'language-member',
+    accountKey: member.accountKey,
+    nickname: member.nickname,
+    avatar: member.avatar,
+    joinedAt: member.joinedAt
+  }
+}
+
 function verifyAccountSignature(payload, actor, signature) {
   return (
     /^[0-9a-f]{64}$/i.test(actor || '') &&
@@ -132,6 +142,22 @@ function enqueueLanguage(context, operation) {
 
 function sendError(error) {
   pipe.write(JSON.stringify({ type: 'error', data: error.message || String(error) }))
+}
+
+function isValidAvatar(avatar, maxBytes) {
+  return (
+    avatar === null ||
+    Boolean(
+      avatar &&
+      supportedAvatarTypes.has(avatar.mime) &&
+      typeof avatar.data === 'string' &&
+      avatar.data.length > 0 &&
+      avatar.data.length <= Math.ceil((maxBytes * 4) / 3) + 4 &&
+      avatar.data.length % 4 === 0 &&
+      /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(avatar.data) &&
+      b4a.from(avatar.data, 'base64').byteLength <= maxBytes
+    )
+  )
 }
 
 console.log('worker: after requires')
@@ -205,7 +231,8 @@ const profileKey = 'user/profile'
 const pairingCodeVersion = 1
 const pairingCodeApp = 'buryad-ugenuud'
 const pairingCodeTtl = 24 * 60 * 60 * 1000
-const maxAvatarBytes = 2 * 1024 * 1024
+const maxUserAvatarBytes = 2 * 1024 * 1024
+const maxLanguageAvatarBytes = 80 * 1024
 const supportedAvatarTypes = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif'])
 
 console.log('worker: after consts')
@@ -247,7 +274,10 @@ async function userApply(batch, view, host) {
         `devices/${author}`,
         JSON.stringify({ active: true, owner: true, signerKey: op.signerKey })
       )
-      await view.put(profileKey, JSON.stringify({ nickname: '', avatar: null }))
+      await view.put(
+        profileKey,
+        JSON.stringify({ nickname: '', avatar: null, languageAvatar: null })
+      )
       await host.ackWriter(node.from.key)
       continue
     }
@@ -264,7 +294,15 @@ async function userApply(batch, view, host) {
         await view.put('user/account-signing-key', JSON.stringify(op.keyPair))
       }
     } else if (op.type === 'user-profile') {
-      await view.put(profileKey, JSON.stringify(op.profile))
+      if (
+        typeof op.profile?.nickname === 'string' &&
+        op.profile.nickname.trim() &&
+        op.profile.nickname.length <= 40 &&
+        isValidAvatar(op.profile.avatar, maxUserAvatarBytes) &&
+        isValidAvatar(op.profile.languageAvatar, maxLanguageAvatarBytes)
+      ) {
+        await view.put(profileKey, JSON.stringify(op.profile))
+      }
     } else if (op.type === 'user-language-add' && /^[0-9a-f]{64}$/i.test(op.language?.key || '')) {
       await view.put(`languages/${op.language.key}`, JSON.stringify(op.language))
     } else if (op.type === 'user-language-remove' && op.key) {
@@ -469,7 +507,9 @@ async function sendProfile() {
   const device = await userBase.view.get(`devices/${keyId(userBase.local.key)}`)
   if (!device || JSON.parse(device.value).active !== true) return
   const entry = await userBase.view.get(profileKey)
-  const profile = entry ? JSON.parse(entry.value) : { nickname: '', avatar: null }
+  const profile = entry
+    ? JSON.parse(entry.value)
+    : { nickname: '', avatar: null, languageAvatar: null }
   pipe.write(JSON.stringify({ type: 'profile', data: profile }))
 }
 
@@ -484,29 +524,37 @@ async function saveProfile(data) {
     if (!supportedAvatarTypes.has(mime)) {
       throw new Error('Avatar must be a PNG, JPEG, WebP, or GIF image')
     }
-    if (
-      typeof encoded !== 'string' ||
-      encoded.length === 0 ||
-      encoded.length > Math.ceil((maxAvatarBytes * 4) / 3) + 4 ||
-      encoded.length % 4 !== 0 ||
-      !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded)
-    ) {
-      throw new Error('Avatar image data is invalid')
-    }
-    const bytes = b4a.from(encoded, 'base64')
-    if (bytes.byteLength > maxAvatarBytes) throw new Error('Avatar must be 2 MB or smaller')
     avatar = { data: encoded, mime }
+    if (!isValidAvatar(avatar, maxUserAvatarBytes)) {
+      throw new Error('Avatar must be a valid image of 2 MiB or smaller')
+    }
+  }
+
+  let languageAvatar = null
+  if (data.languageAvatar) {
+    languageAvatar = data.languageAvatar
+    if (!isValidAvatar(languageAvatar, maxLanguageAvatarBytes)) {
+      throw new Error('Language avatar must be a valid image of 80 KiB or smaller')
+    }
+  }
+  if (languageAvatar && !avatar) {
+    throw new Error('A full-size profile avatar is required for a language avatar')
+  }
+  if (avatar && !languageAvatar) {
+    throw new Error('A compressed language avatar is required when an avatar is set')
   }
 
   if (userBaseReady) await userBaseReady
   if (!userBase) throw new Error('User Autobase is not ready')
-  return enqueueUser(async () => {
-    await userBase.append(encodePayload({ type: 'user-profile', profile: { nickname, avatar } }), {
-      optimistic: true
-    })
+  await enqueueUser(async () => {
+    await userBase.append(
+      encodePayload({ type: 'user-profile', profile: { nickname, avatar, languageAvatar } }),
+      { optimistic: true }
+    )
     await userBase.update()
     await sendProfile()
   })
+  await refreshLanguageMemberProfiles(nickname, languageAvatar)
 }
 
 async function sendPairingStatus() {
@@ -1105,6 +1153,33 @@ function languageApply(batch, view, host) {
           continue
         }
         await view.put('language/meta', JSON.stringify(metadata))
+      } else if (op.type === 'language-member') {
+        const member = op.member
+        const avatar = member?.avatar
+        const validAvatar =
+          avatar === null ||
+          (avatar &&
+            supportedAvatarTypes.has(avatar.mime) &&
+            typeof avatar.data === 'string' &&
+            avatar.data.length > 0 &&
+            avatar.data.length <= Math.ceil((maxLanguageAvatarBytes * 4) / 3) + 4 &&
+            avatar.data.length % 4 === 0 &&
+            /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(avatar.data) &&
+            b4a.from(avatar.data, 'base64').byteLength <= maxLanguageAvatarBytes)
+        if (
+          !member ||
+          !/^[0-9a-f]{64}$/i.test(member.accountKey || '') ||
+          typeof member.nickname !== 'string' ||
+          !member.nickname.trim() ||
+          member.nickname.length > 40 ||
+          !validAvatar ||
+          !Number.isSafeInteger(member.joinedAt) ||
+          !verifyAccountSignature(languageMemberPayload(member), member.accountKey, op.signature)
+        ) {
+          continue
+        }
+        const accountKey = member.accountKey.toLowerCase()
+        await view.put(`members/${accountKey}`, JSON.stringify({ ...member, accountKey }))
       } else if (op.type === 'set-language-role') {
         if (
           !/^[0-9a-f]{64}$/i.test(op.target || '') ||
@@ -1364,6 +1439,11 @@ async function openLanguage(metadata, bootstrap, keyPair = null) {
       await refreshLanguageMetadata(context)
       if (activeLanguageId === context.id) {
         await sendLanguageRolesUnlocked(context)
+        const accountKeyPair = await getAccountSigningKeyPair()
+        const accountKey = accountKeyPair?.publicKey.toLowerCase()
+        if (await hasLanguageRole(context, accountKey, 'administrator')) {
+          await sendLanguageMembersUnlocked(context)
+        }
         await sendAllPollsUnlocked(context)
       }
     }).catch(sendError)
@@ -1443,6 +1523,96 @@ async function sendLanguageRolesUnlocked(context) {
   )
 }
 
+async function registerLanguageMember(context) {
+  await context.base.ready()
+  if (userBaseReady) await userBaseReady
+  if (!userBase) throw new Error('User profile is not ready')
+  const accountKeyPair = await ensureAccountSigningKeyPair()
+  const accountKey = accountKeyPair.publicKey.toLowerCase()
+  if (await context.base.view.get(`members/${accountKey}`)) return
+
+  const profileEntry = await userBase.view.get(profileKey)
+  const profile = profileEntry
+    ? JSON.parse(profileEntry.value)
+    : { nickname: '', avatar: null, languageAvatar: null }
+  const nickname = String(profile.nickname || '').trim()
+  if (!nickname) throw new Error('Set a nickname before joining a language')
+  const avatar = profile.languageAvatar || null
+  if (!isValidAvatar(avatar, maxLanguageAvatarBytes)) {
+    throw new Error('Save your profile again to create a language avatar of 80 KiB or smaller')
+  }
+
+  await writeLanguageMember(context, accountKeyPair, {
+    accountKey,
+    nickname,
+    avatar,
+    joinedAt: Date.now()
+  })
+}
+
+async function writeLanguageMember(context, accountKeyPair, member) {
+  const accountKey = accountKeyPair.publicKey.toLowerCase()
+  const payload = languageMemberPayload(member)
+  await context.base.append(
+    encodePayload({
+      type: 'language-member',
+      member,
+      signature: keyId(
+        crypto.sign(encodePayload(payload), b4a.from(accountKeyPair.secretKey, 'hex'))
+      )
+    }),
+    { optimistic: true }
+  )
+  await context.base.update()
+  if (!(await context.base.view.get(`members/${accountKey}`))) {
+    throw new Error('Language membership was rejected by the language database')
+  }
+}
+
+async function refreshLanguageMemberProfiles(nickname, avatar) {
+  if (languages.size === 0) return
+  const accountKeyPair = await getAccountSigningKeyPair()
+  if (!accountKeyPair) return
+  const accountKey = accountKeyPair.publicKey.toLowerCase()
+
+  for (const context of languages.values()) {
+    await enqueueLanguage(context, async () => {
+      const entry = await context.base.view.get(`members/${accountKey}`)
+      if (!entry) return
+      const current = JSON.parse(entry.value)
+      await writeLanguageMember(context, accountKeyPair, {
+        accountKey,
+        nickname,
+        avatar,
+        joinedAt: current.joinedAt
+      })
+    })
+  }
+}
+
+function sendLanguageMembers(context) {
+  return enqueueLanguage(context, async () => {
+    const accountKeyPair = await ensureAccountSigningKeyPair()
+    const accountKey = accountKeyPair.publicKey.toLowerCase()
+    if (!(await hasLanguageRole(context, accountKey, 'administrator'))) {
+      throw new Error('Only a language administrator can view joined users')
+    }
+    await sendLanguageMembersUnlocked(context)
+  })
+}
+
+async function sendLanguageMembersUnlocked(context) {
+  await context.base.ready()
+  const members = []
+  for await (const { value } of context.base.view.createReadStream({
+    gte: 'members/',
+    lte: 'members/\xff'
+  })) {
+    members.push(JSON.parse(value))
+  }
+  pipe.write(JSON.stringify({ type: 'language-members', languageId: context.id, members }))
+}
+
 async function sendLanguages() {
   try {
     const accountKeyPair = await getAccountSigningKeyPair()
@@ -1487,6 +1657,7 @@ async function createLanguage(data) {
   await context.base.update()
   await context.base.flush()
   await context.base.local.setUserData('language/joined', b4a.from('1'))
+  await registerLanguageMember(context)
   context.name = name
   context.description = description
   languages.set(context.id, context)
@@ -1514,6 +1685,7 @@ async function joinLanguage(data) {
     b4a.from(key, 'hex')
   )
   languages.set(context.id, context)
+  await registerLanguageMember(context)
   activeLanguageId = context.id
   await addLanguageToUserRegistry(context)
   await sendLanguages()
@@ -1641,6 +1813,11 @@ function handleLanguage(operation) {
   if (operation.cmd === 'join') return joinLanguage(operation)
   if (operation.cmd === 'select') return selectLanguage(operation.id)
   if (operation.cmd === 'list') return sendLanguages()
+  if (operation.cmd === 'get-members') {
+    const context = languages.get(operation.languageId || activeLanguageId)
+    if (!context) throw new Error('Select or join a language first')
+    return sendLanguageMembers(context)
+  }
   if (operation.cmd === 'set-role') return setLanguageRole(operation)
   if (operation.cmd === 'saveAPI_Details') return saveTranslationAPI_Details(operation)
   throw new Error('Unknown language command')
@@ -1954,6 +2131,8 @@ async function sendAllPollsUnlocked(context) {
   for await (const { key, value } of pollsStream) {
     if (key.includes('/closed')) continue
     const poll = JSON.parse(value)
+    const creatorEntry = await context.base.view.get(`members/${poll.creator}`)
+    poll.creatorProfile = creatorEntry ? JSON.parse(creatorEntry.value) : null
     poll.closed = (await context.base.view.get(`polls/${poll.id}/closed`)) !== null
     poll.votes = await getPollResultsUnlocked(context, poll.id)
     poll.hasVoted = voter ? await getVoteUnlocked(context, poll.id, voter) : false
