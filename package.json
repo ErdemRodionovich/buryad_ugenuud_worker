@@ -19,6 +19,7 @@
   "type": "commonjs",
   "dependencies": {
     "autobase": "^7.28.1",
+    "bare-os": "^3.9.3",
     "bare-path": "^3.0.1",
     "bare-storage": "^1.1.0",
     "corestore": "^7.11.0",

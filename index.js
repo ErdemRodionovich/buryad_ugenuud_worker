@@ -6,6 +6,7 @@ const goodbye = require('graceful-goodbye')
 const FramedStream = require('framed-stream')
 const path = require('bare-path')
 const fs = require('bare-fs')
+const os = require('bare-os')
 const dir = require('bare-storage')
 const Autobase = require('autobase')
 const Hyperbee = require('hyperbee')
@@ -105,6 +106,8 @@ const runtime = {
   FramedStream,
   path,
   fs,
+  os,
+  devicePlatform: Bare.platform,
   dir,
   Autobase,
   Hyperbee,
@@ -123,9 +126,11 @@ const runtime = {
   languages,
   languageDirectory,
   userBaseDirectory,
+  appStorageDirectory: path.join(updaterConfig.dir, 'app-storage'),
   registryStore,
   localStateView,
   userStoragePath,
+  deviceDataResetting: false,
   profileKey,
   pairingCodeVersion,
   pairingCodeApp,
@@ -256,6 +261,12 @@ function sendPeerCount() {
 }
 
 goodbye(async () => {
+  if (runtime.deviceDataResetting) {
+    await updater_swarm.destroy()
+    await pear.close()
+    await updater_store.close()
+    return
+  }
   for (const session of pairingSessions.values()) await stopPairingSession(session)
   await updater_swarm.destroy()
   await swarm.destroy()
