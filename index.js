@@ -8,6 +8,7 @@ const path = require('bare-path')
 const fs = require('bare-fs')
 const os = require('bare-os')
 const dir = require('bare-storage')
+const { isBareKit } = require('which-runtime')
 const Autobase = require('autobase')
 const Hyperbee = require('hyperbee')
 const crypto = require('hypercore-crypto')
@@ -25,9 +26,19 @@ const createTranslationsModule = require('./lib/translations')
 
 console.log('worker: after requires')
 function parseArgs(argsArray) {
+  if (isBareKit) {
+    return {
+      updates: argsArray[0],
+      version: argsArray[1],
+      upgrade: argsArray[2],
+      productName: argsArray[3],
+      dir: argsArray[4],
+      appPath: argsArray[5]
+    }
+  }
+
   const flags = { _: [] }
-  // Slice off the entry script path (index 0)
-  const args = argsArray.slice(1)
+  const args = argsArray.slice(2)
 
   for (let i = 0; i < args.length; i++) {
     const arg = args[i]

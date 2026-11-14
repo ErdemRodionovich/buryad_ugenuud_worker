@@ -52,9 +52,9 @@ The `imports` field in `package.json` maps `pear-runtime` per platform, so the s
 
 ### Arguments
 
-The worker reads its configuration from positional arguments passed by the parent via `PearRuntime.run(entry, args)`.
+The worker reads its configuration from arguments passed by the parent via `PearRuntime.run(entry, args)`. BareKit mobile hosts pass positional arguments; desktop Electron passes named flags.
 
-On desktop, `Bare.argv` starts with the executable path (`argv[0]`) and the worker entry path (`argv[1]`), so the passed arguments land at `Bare.argv[2..7]`; on mobile (BareKit) they land at `Bare.argv[0..3]`. The worker offsets the indices via [`which-runtime`][which-runtime] so the same argument order works on all platforms:
+On desktop, `Bare.argv` starts with the executable path (`argv[0]`) and the worker entry path (`argv[1]`), so named arguments start at `Bare.argv[2]`. On mobile (BareKit), the four positional values land at `Bare.argv[0..3]`:
 
 | `args` | `Bare.argv` desktop | `Bare.argv` mobile | Field     | Description                                                                            |
 | ------ | ------------------- | ------------------ | --------- | -------------------------------------------------------------------------------------- |
